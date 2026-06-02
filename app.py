@@ -1,5 +1,5 @@
 # Import the standard library and third-party modules
-import sqlite3
+import psycopg2
 import logging
 import csv
 import io
@@ -19,8 +19,6 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 # ---------- Flask Web Server ----------
-# Create a Flask app to handle health checks. This keeps Render's platform
-# from thinking your bot has crashed. It runs on a separate thread.
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -32,15 +30,16 @@ def health():
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
-DATABASE_PATH = os.environ.get('DATABASE_PATH', '/data/debts.db')
-# The `/data` directory is where Render will mount the persistent disk.
+
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is required!")
 
 # ---------- Helper Functions ----------
 def normalize_text(text: str) -> str:
     """Normalize text for case-insensitive search."""
     if not text:
         return ""
-    # Cyrillic to Latin mapping for normalization
     cyrillic_to_latin = {
         'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
         'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
@@ -57,16 +56,18 @@ def normalize_text(text: str) -> str:
     return normalized
 
 # ---------- Database Setup ----------
-def init_db():
-    """Set up the database and ensure the /data directory exists."""
-    # Create the /data directory if it doesn't exist.
-    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
 
-    conn = sqlite3.connect(DATABASE_PATH)
+def init_db():
+    """Set up the cloud PostgreSQL database schemas."""
+    conn = get_db()
     cursor = conn.cursor()
+    
+    # Created using BIGINT to flawlessly handle larger modern Telegram IDs
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
+            telegram_id BIGINT PRIMARY KEY,
             username TEXT,
             first_name TEXT,
             role TEXT CHECK(role IN ('admin','seller','viewer')) NOT NULL,
@@ -75,32 +76,24 @@ def init_db():
     ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS debts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             customer_name TEXT NOT NULL,
+            customer_name_normalized TEXT,
             phone TEXT,
             amount_owed REAL NOT NULL,
             remaining_balance REAL NOT NULL,
             notes TEXT,
-            seller_telegram_id INTEGER NOT NULL,
+            seller_telegram_id BIGINT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (seller_telegram_id) REFERENCES users(telegram_id)
         )
     ''')
-    cursor.execute("PRAGMA table_info(debts)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if 'customer_name_normalized' not in columns:
-        cursor.execute("ALTER TABLE debts ADD COLUMN customer_name_normalized TEXT")
-        cursor.execute("SELECT id, customer_name FROM debts")
-        rows = cursor.fetchall()
-        for row in rows:
-            norm_name = normalize_text(row[1])
-            cursor.execute("UPDATE debts SET customer_name_normalized = ? WHERE id = ?", (norm_name, row[0]))
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_debt_name_normalized ON debts(customer_name_normalized)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_debt_phone ON debts(phone)')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             debt_id INTEGER NOT NULL,
             amount_paid REAL NOT NULL,
             payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -113,13 +106,10 @@ def init_db():
     conn.close()
 
 # ---------- Database Functions ----------
-def get_db():
-    return sqlite3.connect(DATABASE_PATH)
-
 def get_user(telegram_id: int) -> Optional[Dict]:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, username, first_name, role FROM users WHERE telegram_id = ?", (telegram_id,))
+    cursor.execute("SELECT telegram_id, username, first_name, role FROM users WHERE telegram_id = %s", (telegram_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -130,11 +120,11 @@ def create_user(telegram_id: int, username: str, first_name: str, role: str) -> 
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO users (telegram_id, username, first_name, role) VALUES (?, ?, ?, ?)",
+        cursor.execute("INSERT INTO users (telegram_id, username, first_name, role) VALUES (%s, %s, %s, %s)",
                        (telegram_id, username, first_name, role))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False
     finally:
         conn.close()
@@ -142,7 +132,7 @@ def create_user(telegram_id: int, username: str, first_name: str, role: str) -> 
 def delete_user(telegram_id: int) -> bool:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
+    cursor.execute("DELETE FROM users WHERE telegram_id = %s", (telegram_id,))
     conn.commit()
     affected = cursor.rowcount
     conn.close()
@@ -170,18 +160,18 @@ def add_debt(customer_name: str, phone: str, amount: float, notes: str, seller_t
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO debts (customer_name, customer_name_normalized, phone, amount_owed, remaining_balance, notes, seller_telegram_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (customer_name, norm_name, phone, amount, amount, notes, seller_telegram_id)
     )
+    debt_id = cursor.fetchone()[0]
     conn.commit()
-    debt_id = cursor.lastrowid
     conn.close()
     return debt_id
 
 def get_debt(debt_id: int) -> Optional[Dict]:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, customer_name, phone, amount_owed, remaining_balance, notes, seller_telegram_id, created_at, updated_at FROM debts WHERE id = ?", (debt_id,))
+    cursor.execute("SELECT id, customer_name, phone, amount_owed, remaining_balance, notes, seller_telegram_id, created_at, updated_at FROM debts WHERE id = %s", (debt_id,))
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -196,11 +186,11 @@ def update_debt(debt_id: int, **kwargs) -> bool:
     if "customer_name" in updates:
         updates["customer_name_normalized"] = normalize_text(updates["customer_name"])
     updates["updated_at"] = datetime.now().isoformat()
-    set_clause = ", ".join([f"{key} = ?" for key in updates.keys()])
+    set_clause = ", ".join([f"{key} = %s" for key in updates.keys()])
     values = list(updates.values()) + [debt_id]
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute(f"UPDATE debts SET {set_clause} WHERE id = ?", values)
+    cursor.execute(f"UPDATE debts SET {set_clause} WHERE id = %s", values)
     conn.commit()
     affected = cursor.rowcount
     conn.close()
@@ -209,7 +199,7 @@ def update_debt(debt_id: int, **kwargs) -> bool:
 def delete_debt(debt_id: int) -> bool:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM debts WHERE id = ?", (debt_id,))
+    cursor.execute("DELETE FROM debts WHERE id = %s", (debt_id,))
     conn.commit()
     affected = cursor.rowcount
     conn.close()
@@ -222,8 +212,8 @@ def add_payment(debt_id: int, amount: float, notes: str = "") -> bool:
     new_balance = debt["remaining_balance"] - amount
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO payments (debt_id, amount_paid, notes) VALUES (?, ?, ?)", (debt_id, amount, notes))
-    cursor.execute("UPDATE debts SET remaining_balance = ?, updated_at = ? WHERE id = ?", (new_balance, datetime.now().isoformat(), debt_id))
+    cursor.execute("INSERT INTO payments (debt_id, amount_paid, notes) VALUES (%s, %s, %s)", (debt_id, amount, notes))
+    cursor.execute("UPDATE debts SET remaining_balance = %s, updated_at = %s WHERE id = %s", (new_balance, datetime.now().isoformat(), debt_id))
     conn.commit()
     conn.close()
     return True
@@ -237,7 +227,7 @@ def search_debts(query: str) -> List[Dict]:
                d.seller_telegram_id, d.created_at, d.updated_at, u.username, u.first_name
         FROM debts d
         JOIN users u ON d.seller_telegram_id = u.telegram_id
-        WHERE d.phone LIKE ? OR d.customer_name_normalized LIKE ?
+        WHERE d.phone LIKE %s OR d.customer_name_normalized LIKE %s
         ORDER BY d.created_at DESC
     """, (f"%{query}%", f"%{norm_query}%"))
     rows = cursor.fetchall()
@@ -255,14 +245,14 @@ def get_all_debts(filters: Dict = None) -> List[Dict]:
     params = []
     if filters:
         if filters.get("seller_id"):
-            conditions.append("d.seller_telegram_id = ?")
+            conditions.append("d.seller_telegram_id = %s")
             params.append(filters["seller_id"])
         if filters.get("customer_name"):
             norm_name = normalize_text(filters["customer_name"])
-            conditions.append("d.customer_name_normalized LIKE ?")
+            conditions.append("d.customer_name_normalized LIKE %s")
             params.append(f"%{norm_name}%")
         if filters.get("phone"):
-            conditions.append("d.phone LIKE ?")
+            conditions.append("d.phone LIKE %s")
             params.append(f"%{filters['phone']}%")
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -290,7 +280,7 @@ def get_outstanding_by_seller() -> List[Dict]:
         FROM users u
         LEFT JOIN debts d ON u.telegram_id = d.seller_telegram_id
         WHERE u.role IN ('admin','seller')
-        GROUP BY u.telegram_id
+        GROUP BY u.telegram_id, u.username, u.first_name
         ORDER BY SUM(d.remaining_balance) DESC
     """)
     rows = cursor.fetchall()
@@ -305,7 +295,7 @@ def get_largest_debtors(limit: int = 5) -> List[Dict]:
         FROM debts
         GROUP BY customer_name, phone
         ORDER BY total_balance DESC
-        LIMIT ?
+        LIMIT %s
     """, (limit,))
     rows = cursor.fetchall()
     conn.close()
@@ -401,7 +391,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if action == "menu_adddebt":
         if role not in ("admin", "seller"):
-            await query.edit_message_text("⛔ Фақат сотувчилар ва админлар қарз қўша олади.", reply_markup=get_main_keyboard(role))
+            await query.edit_message_text("⛔ Фақат сотувчилар ва adminлар қарз қўша олади.", reply_markup=get_main_keyboard(role))
             return
         context.user_data['action'] = 'adddebt'
         await query.edit_message_text("➕ **Янги қарз қўшиш**\n\nМизожнинг **исмини** ёзинг:", parse_mode="Markdown")
@@ -668,7 +658,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
                 return ConversationHandler.END
             context.user_data['new_user_id'] = telegram_id
-            context.user_data['action'] = 'adduser_role'  # Fix: updates action state to read role input correctly next
+            context.user_data['action'] = 'adduser_role'
             await update.message.reply_text("Ролни ёзинг (admin / seller / viewer):")
             return USER_ROLE
         except ValueError:
@@ -763,7 +753,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def run_telegram_bot():
     """This function runs the Telegram bot in a separate thread."""
-    # Setup custom async loop for background thread execution
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -793,24 +782,19 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("help", start))
 
     logging.info("Telegram bot started.")
-    # stop_signals=None prevents background thread signal-handling error crashes on cloud servers
     app.run_polling(stop_signals=None)
 
 # ---------- Main Entry Point ----------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    # Set up the database.
+    # Initialize connection to PostgreSQL database
     init_db()
     
-    # Start the Telegram bot in a background thread.
-    # This is crucial: the Flask web server needs to run in the main thread
-    # to respond to Render's health checks, so the bot runs in another thread.
     bot_thread = threading.Thread(target=run_telegram_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # Start the Flask web server.
     port = int(os.environ.get('PORT', 5000))
     logging.info(f"Starting Flask web server on port {port}")
     flask_app.run(host='0.0.0.0', port=port)
