@@ -6,10 +6,11 @@ import re
 import unicodedata
 import threading
 import os
+import asyncio
 from datetime import datetime
 from typing import List, Dict, Optional
 from flask import Flask, request, jsonify, render_template_string, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, Bot
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
     MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -192,7 +193,6 @@ MINI_APP_HTML = """
         let activeFilter = 'all';
         let currentUserId = 0;
 
-        // Extract and assign authentic user profiles directly from safe context execution wrappers
         const user = tg.initDataUnsafe?.user;
         if (user) {
             currentUserId = user.id;
@@ -200,7 +200,6 @@ MINI_APP_HTML = """
         }
         document.getElementById('current-date').innerText = new Date().toLocaleDateString('uz-UZ', { weekday: 'long', month: 'short', day: 'numeric' });
 
-        // Drawer Modal Controls Interface Mapping
         function openModal(id) {
             const modal = document.getElementById(id);
             modal.classList.remove('hidden');
@@ -217,7 +216,6 @@ MINI_APP_HTML = """
             setTimeout(() => modal.classList.add('hidden'), 200);
         }
 
-        // Deep Analytical Logs Fetching Handler
         async function openProfileDrawer(id, name, phone, remaining, amount_owed, notes) {
             document.getElementById('payment-debt-id').value = id;
             document.getElementById('drawer-customer-name').innerText = name;
@@ -227,7 +225,6 @@ MINI_APP_HTML = """
             document.getElementById('payment-amount').max = remaining;
             document.getElementById('payment-form').reset();
 
-            // Toggle element interaction logic block states based on payment balances
             if (remaining <= 0) {
                 document.getElementById('payment-actions-section').classList.add('hidden');
                 document.getElementById('drawer-balance').className = "text-lg font-black text-emerald-600 block mt-0.5";
@@ -236,7 +233,6 @@ MINI_APP_HTML = """
                 document.getElementById('drawer-balance').className = "text-lg font-black text-rose-600 block mt-0.5";
             }
 
-            // Real-time asynchronous transaction timeline generation block
             const historyContainer = document.getElementById('drawer-history-container');
             historyContainer.innerHTML = '<div class="text-[11px] text-slate-400">Yuklanmoqda...</div>';
 
@@ -269,7 +265,6 @@ MINI_APP_HTML = """
             }
         }
 
-        // Dashboard Core Orchestrator Feed
         async function loadDataStream() {
             try {
                 const response = await fetch('/api/dashboard');
@@ -291,7 +286,6 @@ MINI_APP_HTML = """
             }
         }
 
-        // List Interface Render Loop Engines
         function renderRecordsList(items) {
             const container = document.getElementById('records-container');
             container.innerHTML = '';
@@ -324,7 +318,6 @@ MINI_APP_HTML = """
             });
         }
 
-        // Filter and Search Drivers
         function handleSearch() {
             const query = document.getElementById('search-input').value.toLowerCase();
             applyFiltersAndSearch(query, activeFilter);
@@ -362,7 +355,6 @@ MINI_APP_HTML = """
             renderRecordsList(filtered);
         }
 
-        // Operational Submissions Core Mapping Endpoints
         async function submitAddDebt(e) {
             e.preventDefault();
             const payload = {
@@ -433,7 +425,6 @@ MINI_APP_HTML = """
             }
         }
 
-        // Initialize Primary Engine Hook Loop
         loadDataStream();
     </script>
 </body>
@@ -447,7 +438,6 @@ def health():
 
 @flask_app.route('/webapp')
 def webapp_interface():
-    """Serves the highly optimized premium minimalist interface view."""
     return render_template_string(MINI_APP_HTML)
 
 @flask_app.route('/api/dashboard')
@@ -517,19 +507,14 @@ def api_delete_debt(debt_id):
 
 @flask_app.route('/api/export_csv')
 def api_export_csv():
-    """Generates an immediate downloadable professional Excel/CSV breakdown report statement."""
     try:
         debts = get_all_debts()
         output = io.StringIO()
         writer = csv.writer(output)
-        
-        # Write statement records meta configuration layout headings
         writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', 'Boshlang\'ich Qarz', 'Qolgan Balans', 'Eslatma/Izoh', 'Mas\'ul Xodim', 'Sana'])
         for d in debts:
             writer.writerow([d['id'], d['customer_name'], d['phone'], d['amount_owed'], d['remaining_balance'], d['notes'], d['seller_name'], d['created_at']])
-            
         csv_data = output.getvalue()
-        # Return correct spreadsheet download byte streams
         return Response(
             csv_data,
             mimetype="text/csv",
@@ -538,12 +523,54 @@ def api_export_csv():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# NEW FEATURE: Secure Automated End-of-Day Group Backup Hook
+@flask_app.route('/api/trigger_backup', methods=['GET', 'POST'])
+def api_trigger_backup():
+    group_id = os.environ.get('BACKUP_GROUP_ID')
+    if not group_id:
+        return jsonify({"error": "BACKUP_GROUP_ID muhit o'zgaruvchisi o'rnatilmagan."}), 400
+    try:
+        debts = get_all_debts()
+        total_outstanding = get_total_outstanding()
+        active_count = len([d for d in debts if d['remaining_balance'] > 0])
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', 'Boshlang\'ich Qarz', 'Qolgan Balans', 'Eslatma/Izoh', 'Mas\'ul Xodim', 'Sana'])
+        for d in debts:
+            writer.writerow([d['id'], d['customer_name'], d['phone'], d['amount_owed'], d['remaining_balance'], d['notes'], d['seller_name'], d['created_at']])
+        
+        csv_bytes = output.getvalue().encode('utf-8')
+        file_stream = io.BytesIO(csv_bytes)
+        file_stream.name = f"Supermarket_Qarz_Backup_{datetime.now().strftime('%Y_%m_%d')}.csv"
+        
+        # Async invocation container inside standalone Flask request threads
+        async def send_file_to_group():
+            bot = Bot(token=BOT_TOKEN)
+            async with bot:
+                await bot.send_document(
+                    chat_id=int(group_id),
+                    document=file_stream,
+                    caption=(
+                        f"📁 **KUNLIK AVTOMATIK BACKUP HISOBOTI**\n"
+                        f"📆 Sana: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                        f"📊 **Do'kon Ko'rsatkichlari:**\n"
+                        f"• Jami bozordagi qarz: {total_outstanding:,.0f} UZS\n"
+                        f"• Faol qarzdorlar soni: {active_count} ta\n\n"
+                        f"🔒 *Ushbu ma'lumotlar bazasi zaxira nusxasi avtomatik ravishda saqlandi.*"
+                    )
+                )
+        
+        asyncio.run(send_file_to_group())
+        return jsonify({"success": True, "message": "Backup pushed to Telegram group successfully."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ---------- Persistent Workspace Data Storage Configuration ----------
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
 
-# CHANGED: Changed fallback from '/data/debts.db' to local file directory 'debts.db' to bypass system folder permissions block
 DATABASE_PATH = os.environ.get('DATABASE_PATH', 'debts.db')
 
 # ---------- Text Normalization Search Modules ----------
