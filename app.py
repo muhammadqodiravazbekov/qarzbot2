@@ -8,7 +8,7 @@ import threading
 import os
 from datetime import datetime
 from typing import List, Dict, Optional
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
@@ -19,14 +19,14 @@ from telegram.request import HTTPXRequest
 # ---------- Flask Web Server & Mini App Frontend ----------
 flask_app = Flask(__name__)
 
-# Premium Minimalist UI Design using Tailwind CSS
+# Premium Ultra-Minimalist UI Design using Tailwind CSS
 MINI_APP_HTML = """
 <!DOCTYPE html>
 <html lang="uz">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Qarz Nazorati</title>
+    <title>Qarz Kontrol</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
@@ -34,111 +34,151 @@ MINI_APP_HTML = """
         .no-scrollbar::-webkit-scrollbar { display: none; }
     </style>
 </head>
-<body class="bg-slate-50 text-slate-900 font-sans antialiased pb-24 selection:bg-indigo-100">
+<body class="bg-[#f8fafc] text-[#0f172a] font-sans antialiased pb-24 selection:bg-indigo-50">
 
-    <div class="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-slate-100 px-4 py-4 flex items-center justify-between">
+    <div class="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-slate-100 px-4 py-3.5 flex items-center justify-between">
         <div>
-            <h1 class="text-lg font-bold tracking-tight text-slate-900" id="user-greeting">Qarz Nazorati</h1>
-            <p class="text-xs text-slate-400 font-medium" id="current-date">Yuklanmoqda...</p>
+            <h1 class="text-base font-bold tracking-tight text-slate-900 flex items-center gap-1.5">
+                <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                <span id="user-greeting">Boshqaruv Paneli</span>
+            </h1>
+            <p class="text-[11px] text-slate-400 font-medium" id="current-date">Yuklanmoqda...</p>
         </div>
-        <button onclick="openModal('add-debt-modal')" class="bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white px-3.5 py-1.5 rounded-xl text-xs font-semibold tracking-wide shadow-sm shadow-indigo-100 transition-all flex items-center gap-1">
-            <span class="text-sm font-bold">+</span> Yangi Qarz
-        </button>
+        <div class="flex items-center gap-2">
+            <a href="/api/export_csv" target="_blank" class="p-2 text-slate-500 hover:text-slate-700 bg-slate-100 rounded-xl transition-all active:scale-95" title="Hisobot yuklash">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+            </a>
+            <button onclick="openModal('add-debt-modal')" class="bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white px-3.5 py-1.5 rounded-xl text-xs font-semibold shadow-sm transition-all">
+                + Yangi Qarz
+            </button>
+        </div>
     </div>
 
-    <div class="max-w-md mx-auto p-4 space-y-5">
+    <div class="max-w-md mx-auto p-4 space-y-4">
         
-        <div class="grid grid-cols-2 gap-3">
-            <div class="bg-white border border-slate-100 p-4 rounded-2xl shadow-sm">
-                <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Umumiy Qarz</span>
-                <span id="total-amount" class="text-xl font-extrabold text-slate-900 block mt-1">0.00 UZS</span>
+        <div class="grid grid-cols-3 gap-2">
+            <div class="bg-white border border-slate-100 p-3 rounded-2xl shadow-sm">
+                <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Umumiy Qarz</span>
+                <span id="total-amount" class="text-sm font-extrabold text-slate-900 block mt-0.5 truncate">0 UZS</span>
             </div>
-            <div class="bg-white border border-slate-100 p-4 rounded-2xl shadow-sm">
-                <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Faol Mijozlar</span>
-                <span id="total-debtors" class="text-xl font-extrabold text-indigo-600 block mt-1">0 ta</span>
+            <div class="bg-white border border-slate-100 p-3 rounded-2xl shadow-sm">
+                <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Faol Mijozlar</span>
+                <span id="total-debtors" class="text-sm font-extrabold text-indigo-600 block mt-0.5">0 ta</span>
+            </div>
+            <div class="bg-white border border-slate-100 p-3 rounded-2xl shadow-sm">
+                <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Yopilganlar</span>
+                <span id="total-settled" class="text-sm font-extrabold text-emerald-600 block mt-0.5">0 ta</span>
             </div>
         </div>
 
-        <div class="space-y-2.5">
+        <div class="space-y-2">
             <div class="relative">
-                <input type="text" id="search-input" oninput="handleSearch()" placeholder="Mijoz ismi yoki telefon raqami..." 
-                       class="w-full bg-white border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl pl-3 pr-10 py-2.5 text-sm outline-none transition-all placeholder:text-slate-400 shadow-sm">
-                <span class="absolute right-3.5 top-3.5 text-slate-400 pointer-events-none">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                <input type="text" id="search-input" oninput="handleSearch()" placeholder="Ism yoki telefon raqami orqali qidirish..." 
+                       class="w-full bg-white border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl pl-3 pr-10 py-2.5 text-xs outline-none transition-all placeholder:text-slate-400 shadow-sm">
+                <span class="absolute right-3.5 top-3 text-slate-400 pointer-events-none">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
                 </span>
             </div>
             
-            <div class="flex gap-1.5 overflow-x-auto no-scrollbar py-0.5">
-                <button onclick="filterDebts('all')" id="filter-all" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 text-white shadow-sm transition-all whitespace-nowrap">Hammasi</button>
-                <button onclick="filterDebts('active')" id="filter-active" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap">Qarzdorlar</button>
-                <button onclick="filterDebts('settled')" id="filter-settled" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap">To'langanlar</button>
+            <div class="flex gap-1 overflow-x-auto no-scrollbar py-0.5">
+                <button onclick="filterDebts('all')" id="filter-all" class="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 text-white shadow-sm transition-all whitespace-nowrap">Barchasi</button>
+                <button onclick="filterDebts('active')" id="filter-active" class="px-3 py-1.5 rounded-lg text-[11px] font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap">Qarzdorlar</button>
+                <button onclick="filterDebts('settled')" id="filter-settled" class="px-3 py-1.5 rounded-lg text-[11px] font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap">To'langanlar</button>
             </div>
         </div>
 
-        <div class="space-y-3">
-            <h3 class="text-xs font-bold text-slate-400 uppercase tracking-wider px-1">Tizimdagi yozuvlar</h3>
+        <div class="space-y-2">
+            <h3 class="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-1">Ro'yxat yozuvlari</h3>
             
-            <div id="loading-spinner" class="text-center py-12 text-slate-400 text-sm font-medium">
+            <div id="loading-spinner" class="text-center py-10 text-slate-400 text-xs font-medium">
                 Ma'lumotlar yuklanmoqda...
             </div>
 
-            <div id="records-container" class="space-y-2.5 hidden">
+            <div id="records-container" class="space-y-2 hidden">
                 </div>
         </div>
     </div>
 
-    <div id="add-debt-modal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-end justify-center hidden opacity-0 transition-opacity duration-200">
-        <div class="bg-white w-full max-w-md rounded-t-3xl p-5 space-y-4 shadow-xl transform translate-y-full transition-transform duration-200">
+    <div id="profile-drawer" class="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-end justify-center hidden opacity-0 transition-opacity duration-200">
+        <div class="bg-white w-full max-w-md rounded-t-3xl p-5 space-y-4 shadow-2xl transform translate-y-full transition-transform duration-200 max-h-[92vh] overflow-y-auto no-scrollbar">
             <div class="flex justify-between items-center border-b border-slate-100 pb-3">
-                <h3 class="font-bold text-slate-900 text-base">Yangi qarz yozuvi</h3>
-                <button onclick="closeModal('add-debt-modal')" class="text-slate-400 hover:text-slate-600 text-lg font-bold px-2">&times;</button>
+                <div>
+                    <h3 class="font-bold text-slate-900 text-base" id="drawer-customer-name">Mijoz Profili</h3>
+                    <p class="text-[11px] text-slate-400 font-medium" id="drawer-customer-phone">📞 -</p>
+                </div>
+                <button onclick="closeModal('profile-drawer')" class="text-slate-400 hover:text-slate-600 text-xl font-bold px-2">&times;</button>
+            </div>
+
+            <div class="bg-slate-50 border border-slate-100 rounded-2xl p-4 flex justify-between items-center">
+                <div>
+                    <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Qolgan Balans</span>
+                    <span id="drawer-balance" class="text-lg font-black text-rose-600 block mt-0.5">0 UZS</span>
+                </div>
+                <div class="text-right">
+                    <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Boshlang'ich qarz</span>
+                    <span id="drawer-initial" class="text-xs font-semibold text-slate-500 block mt-0.5">0 UZS</span>
+                </div>
+            </div>
+
+            <div class="space-y-2">
+                <h4 class="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-0.5">To'lovlar Tarixi Logi</h4>
+                <div id="drawer-history-container" class="space-y-1.5 max-h-40 overflow-y-auto no-scrollbar">
+                    </div>
+            </div>
+
+            <div id="payment-actions-section" class="border-t border-slate-100 pt-3 space-y-2.5">
+                <h4 class="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-0.5">To'lov qabul qilish (Qisman/To'liq)</h4>
+                <form id="payment-form" onsubmit="submitPayment(event)" class="grid grid-cols-3 gap-2">
+                    <input type="hidden" id="payment-debt-id">
+                    <div class="col-span-2">
+                        <input type="number" id="payment-amount" required min="1" placeholder="Summa kiritish (UZS)" 
+                               class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
+                    </div>
+                    <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl text-xs transition-all active:scale-95">
+                        Kiritish
+                    </button>
+                    <div class="col-span-3">
+                        <input type="text" id="payment-notes" placeholder="To'lov izohi (Masalan: naqd, karta orqali...)" 
+                               class="w-full border border-slate-200 rounded-xl px-3 py-1.5 text-[11px] outline-none focus:border-indigo-500">
+                    </div>
+                </form>
+            </div>
+
+            <div class="border-t border-slate-100 pt-3 flex gap-2">
+                <button type="button" onclick="submitDeleteDebt()" class="w-full bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold py-2 rounded-xl text-xs transition-all border border-rose-100 flex items-center justify-center gap-1">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-14v4M1 7h22"></path></svg>
+                    Yozuvni butunlay o'chirish
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div id="add-debt-modal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-end justify-center hidden opacity-0 transition-opacity duration-200">
+        <div class="bg-white w-full max-w-md rounded-t-3xl p-5 space-y-4 shadow-2xl transform translate-y-full transition-transform duration-200">
+            <div class="flex justify-between items-center border-b border-slate-100 pb-3">
+                <h3 class="font-bold text-slate-900 text-base">Yangi qarz hisobini ochish</h3>
+                <button onclick="closeModal('add-debt-modal')" class="text-slate-400 hover:text-slate-600 text-xl font-bold px-2">&times;</button>
             </div>
             <form id="add-debt-form" onsubmit="submitAddDebt(event)" class="space-y-3">
                 <div>
-                    <label class="block text-xs font-semibold text-slate-500 mb-1">Mijoz to'liq ismi *</label>
-                    <input type="text" id="form-name" required class="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-500">
+                    <label class="block text-[11px] font-semibold text-slate-500 mb-1">Mijoz ism-sharifi *</label>
+                    <input type="text" id="form-name" required class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
                 </div>
                 <div>
-                    <label class="block text-xs font-semibold text-slate-500 mb-1">Telefon raqami</label>
-                    <input type="text" id="form-phone" placeholder="+998" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-500">
+                    <label class="block text-[11px] font-semibold text-slate-500 mb-1">Telefon raqami</label>
+                    <input type="text" id="form-phone" placeholder="Masalan: +998901234567" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
                 </div>
                 <div>
-                    <label class="block text-xs font-semibold text-slate-500 mb-1">Qarz miqdori (UZS) *</label>
-                    <input type="number" id="form-amount" required min="1" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-500">
+                    <label class="block text-[11px] font-semibold text-slate-500 mb-1">Qarz miqdori (UZS) *</label>
+                    <input type="number" id="form-amount" required min="1" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
                 </div>
                 <div>
-                    <label class="block text-xs font-semibold text-slate-500 mb-1">Qisqacha izoh</label>
-                    <input type="text" id="form-notes" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-500">
+                    <label class="block text-[11px] font-semibold text-slate-500 mb-1">Maxsus eslatma / Mahsulotlar</label>
+                    <input type="text" id="form-notes" placeholder="Masalan: Un, yog' olindi" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
                 </div>
-                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2.5 rounded-xl text-sm transition-all mt-2">Saqlash</button>
-            </form>
-        </div>
-    </div>
-
-    <div id="payment-modal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-end justify-center hidden opacity-0 transition-opacity duration-200">
-        <div class="bg-white w-full max-w-md rounded-t-3xl p-5 space-y-4 shadow-xl transform translate-y-full transition-transform duration-200">
-            <div class="flex justify-between items-center border-b border-slate-100 pb-3">
-                <h3 class="font-bold text-slate-900 text-base" id="payment-title">Tizimli to'lov</h3>
-                <button onclick="closeModal('payment-modal')" class="text-slate-400 hover:text-slate-600 text-lg font-bold px-2">&times;</button>
-            </div>
-            <form id="payment-form" onsubmit="submitPayment(event)" class="space-y-3">
-                <input type="hidden" id="payment-debt-id">
-                <div>
-                    <label class="block text-xs font-semibold text-slate-500 mb-1">Maksimal to'lov</label>
-                    <input type="text" id="payment-max-display" readonly class="w-full bg-slate-50 border border-slate-100 rounded-xl px-3 py-2 text-sm text-slate-400 outline-none">
-                </div>
-                <div>
-                    <label class="block text-xs font-semibold text-slate-500 mb-1">To'lov miqdori (UZS) *</label>
-                    <input type="number" id="payment-amount" required min="1" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-500">
-                </div>
-                <div>
-                    <label class="block text-xs font-semibold text-slate-500 mb-1">To'lov izohi</label>
-                    <input type="text" id="payment-notes" placeholder="Naqd, karta orqali..." class="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-indigo-500">
-                </div>
-                <div class="grid grid-cols-2 gap-2 mt-2">
-                    <button type="button" onclick="submitDeleteDebt()" class="bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold py-2.5 rounded-xl text-sm transition-all border border-rose-100">O'chirish</button>
-                    <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2.5 rounded-xl text-sm transition-all">To'lovni kiritish</button>
-                </div>
+                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2.5 rounded-xl text-xs transition-all mt-1 shadow-sm">
+                    Tizimga saqlash
+                </button>
             </form>
         </div>
     </div>
@@ -152,15 +192,15 @@ MINI_APP_HTML = """
         let activeFilter = 'all';
         let currentUserId = 0;
 
-        // Display Greeting Based on Execution Context
+        // Extract and assign authentic user profiles directly from safe context execution wrappers
         const user = tg.initDataUnsafe?.user;
         if (user) {
             currentUserId = user.id;
-            document.getElementById('user-greeting').innerText = user.first_name;
+            document.getElementById('user-greeting').innerText = `${user.first_name} | Qarz Kontrol`;
         }
-        document.getElementById('current-date').innerText = new Date().toLocaleDateString('uz-UZ', { weekday: 'long', month: 'long', day: 'numeric' });
+        document.getElementById('current-date').innerText = new Date().toLocaleDateString('uz-UZ', { weekday: 'long', month: 'short', day: 'numeric' });
 
-        // Functional Window Modals Controls
+        // Drawer Modal Controls Interface Mapping
         function openModal(id) {
             const modal = document.getElementById(id);
             modal.classList.remove('hidden');
@@ -177,17 +217,59 @@ MINI_APP_HTML = """
             setTimeout(() => modal.classList.add('hidden'), 200);
         }
 
-        function openPaymentModal(id, name, remaining) {
-            if (remaining <= 0) return; // already paid
+        // Deep Analytical Logs Fetching Handler
+        async function openProfileDrawer(id, name, phone, remaining, amount_owed, notes) {
             document.getElementById('payment-debt-id').value = id;
-            document.getElementById('payment-title').innerText = `${name} - To'lov`;
-            document.getElementById('payment-max-display').value = new Intl.NumberFormat('uz-UZ').format(remaining) + ' UZS';
+            document.getElementById('drawer-customer-name').innerText = name;
+            document.getElementById('drawer-customer-phone').innerText = phone ? `📞 ${phone}` : '📞 Telefon raqami yo\'q';
+            document.getElementById('drawer-balance').innerText = new Intl.NumberFormat('uz-UZ').format(remaining) + ' UZS';
+            document.getElementById('drawer-initial').innerText = new Intl.NumberFormat('uz-UZ').format(amount_owed) + ' UZS';
             document.getElementById('payment-amount').max = remaining;
-            document.getElementById('payment-amount').value = '';
-            openModal('payment-modal');
+            document.getElementById('payment-form').reset();
+
+            // Toggle element interaction logic block states based on payment balances
+            if (remaining <= 0) {
+                document.getElementById('payment-actions-section').classList.add('hidden');
+                document.getElementById('drawer-balance').className = "text-lg font-black text-emerald-600 block mt-0.5";
+            } else {
+                document.getElementById('payment-actions-section').classList.remove('hidden');
+                document.getElementById('drawer-balance').className = "text-lg font-black text-rose-600 block mt-0.5";
+            }
+
+            // Real-time asynchronous transaction timeline generation block
+            const historyContainer = document.getElementById('drawer-history-container');
+            historyContainer.innerHTML = '<div class="text-[11px] text-slate-400">Yuklanmoqda...</div>';
+
+            openModal('profile-drawer');
+
+            try {
+                const res = await fetch(`/api/debt_history/${id}`);
+                const history = await res.json();
+                historyContainer.innerHTML = '';
+
+                if (history.length === 0) {
+                    historyContainer.innerHTML = '<div class="text-[11px] text-slate-400 py-1 px-0.5">Ushbu mijoz bo\'yicha to\'lovlar mavjud emas.</div>';
+                } else {
+                    history.forEach(log => {
+                        const dateObj = new Date(log.payment_date).toLocaleDateString('uz-UZ', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                        const logRow = document.createElement('div');
+                        logRow.className = "flex justify-between items-center bg-slate-50 border border-slate-100 rounded-xl p-2 text-[11px]";
+                        logRow.innerHTML = `
+                            <div>
+                                <span class="font-bold text-emerald-600">+ ${new Intl.NumberFormat('uz-UZ').format(log.amount_paid)} UZS</span>
+                                <p class="text-[10px] text-slate-400 mt-0.5">${log.notes ? log.notes : 'To\'lov qabul qilindi'}</p>
+                            </div>
+                            <span class="text-[10px] text-slate-400 text-right font-medium">${dateObj}</span>
+                        `;
+                        historyContainer.appendChild(logRow);
+                    });
+                }
+            } catch (err) {
+                historyContainer.innerHTML = '<div class="text-[11px] text-rose-500">Tarixni yuklashda xatolik.</div>';
+            }
         }
 
-        // Fetch Operational Context Records From Core Engine
+        // Dashboard Core Orchestrator Feed
         async function loadDataStream() {
             try {
                 const response = await fetch('/api/dashboard');
@@ -197,51 +279,52 @@ MINI_APP_HTML = """
                 
                 document.getElementById('total-amount').innerText = new Intl.NumberFormat('uz-UZ').format(data.total_outstanding) + ' UZS';
                 document.getElementById('total-debtors').innerText = data.debts.filter(d => d.remaining_balance > 0).length + ' ta';
+                document.getElementById('total-settled').innerText = data.debts.filter(d => d.remaining_balance <= 0).length + ' ta';
                 
-                renderRecordsList(rawDebtsData);
+                applyFiltersAndSearch(document.getElementById('search-input').value.toLowerCase(), activeFilter);
                 
                 document.getElementById('loading-spinner').classList.add('hidden');
                 document.getElementById('records-container').classList.remove('hidden');
             } catch (err) {
-                console.error("Critical Stream Interruption:", err);
-                document.getElementById('loading-spinner').innerText = "Aloqa xatosi yuz berdi.";
+                console.error("Critical Storage Interrupt Error:", err);
+                document.getElementById('loading-spinner').innerText = "Ma'lumot uzatish tarmog'ida uzilish yuz berdi.";
             }
         }
 
-        // Display Render Loop Filtering
+        // List Interface Render Loop Engines
         function renderRecordsList(items) {
             const container = document.getElementById('records-container');
             container.innerHTML = '';
             
-            if(items.length === 0) {
-                container.innerHTML = '<div class="text-center py-10 text-slate-400 text-sm font-medium">Hech qanday ma\'lumot topilmadi</div>';
+            if (items.length === 0) {
+                container.innerHTML = '<div class="text-center py-12 text-slate-400 text-xs font-medium">Qidiruv bo\'yicha yozuvlar topilmadi</div>';
                 return;
             }
 
             items.forEach(item => {
                 const isSettled = item.remaining_balance <= 0;
                 const element = document.createElement('div');
-                element.className = `bg-white border ${isSettled ? 'border-slate-100 opacity-60' : 'border-slate-200/60'} p-4 rounded-xl shadow-sm flex justify-between items-center transition-all active:scale-[0.99] cursor-pointer`;
-                element.setAttribute('onclick', `openPaymentModal(${item.id}, "${item.customer_name}", ${item.remaining_balance})`);
+                element.className = `bg-white border ${isSettled ? 'border-slate-100 opacity-60' : 'border-slate-200/50'} p-3.5 rounded-xl shadow-xs flex justify-between items-center transition-all active:scale-[0.99] cursor-pointer hover:border-indigo-100`;
+                element.setAttribute('onclick', `openProfileDrawer(${item.id}, "${item.customer_name}", "${item.phone}", ${item.remaining_balance}, ${item.amount_owed}, "${item.notes || ''}")`);
                 
                 element.innerHTML = `
-                    <div class="space-y-1">
-                        <h4 class="font-bold text-slate-800 text-sm tracking-tight">${item.customer_name}</h4>
-                        <p class="text-xs text-slate-400 font-medium">${item.phone ? '📞 ' + item.phone : '📞 Kiritilmagan'}</p>
-                        ${item.notes ? `<p class="text-xs text-slate-500 bg-slate-50 inline-block px-2 py-0.5 rounded-md border border-slate-100">${item.notes}</p>` : ''}
+                    <div class="space-y-0.5 max-w-[65%]">
+                        <h4 class="font-bold text-slate-800 text-xs tracking-tight truncate">${item.customer_name}</h4>
+                        <p class="text-[10px] text-slate-400 font-medium">${item.phone ? '📞 ' + item.phone : '📞 Rafqam kiritilmagan'}</p>
+                        ${item.notes ? `<p class="text-[10px] text-slate-500 bg-slate-50 inline-block px-2 py-0.5 rounded-md border border-slate-100/70 mt-1 truncate max-w-full">${item.notes}</p>` : ''}
                     </div>
                     <div class="text-right">
-                        <span class="text-sm font-black ${isSettled ? 'text-emerald-600' : 'text-rose-600'}">
+                        <span class="text-xs font-black ${isSettled ? 'text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md' : 'text-rose-600'}">
                             ${isSettled ? "Yopilgan" : new Intl.NumberFormat('uz-UZ').format(item.remaining_balance) + ' UZS'}
                         </span>
-                        <p class="text-[10px] text-slate-400 font-bold mt-0.5 uppercase tracking-wider">Mas'ul: ${item.seller_name}</p>
+                        <p class="text-[9px] text-slate-400 font-bold mt-1 uppercase tracking-wider">Xodim: ${item.seller_name}</p>
                     </div>
                 `;
                 container.appendChild(element);
             });
         }
 
-        // Realtime Unified Data Processing
+        // Filter and Search Drivers
         function handleSearch() {
             const query = document.getElementById('search-input').value.toLowerCase();
             applyFiltersAndSearch(query, activeFilter);
@@ -251,10 +334,10 @@ MINI_APP_HTML = """
             activeFilter = type;
             ['all', 'active', 'settled'].forEach(t => {
                 const btn = document.getElementById(`filter-${t}`);
-                if(t === type) {
-                    btn.className = "px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 text-white shadow-sm transition-all whitespace-nowrap";
+                if (t === type) {
+                    btn.className = "px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 text-white shadow-sm transition-all whitespace-nowrap";
                 } else {
-                    btn.className = "px-3 py-1.5 rounded-lg text-xs font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap";
+                    btn.className = "px-3 py-1.5 rounded-lg text-[11px] font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap";
                 }
             });
             const query = document.getElementById('search-input').value.toLowerCase();
@@ -279,7 +362,7 @@ MINI_APP_HTML = """
             renderRecordsList(filtered);
         }
 
-        // Submissions Operations Endpoints Routing
+        // Operational Submissions Core Mapping Endpoints
         async function submitAddDebt(e) {
             e.preventDefault();
             const payload = {
@@ -287,7 +370,7 @@ MINI_APP_HTML = """
                 phone: document.getElementById('form-phone').value,
                 amount: parseFloat(document.getElementById('form-amount').value),
                 notes: document.getElementById('form-notes').value,
-                seller_id: currentUserId || 123456789 // Fallback dummy if testing outside Telegram
+                seller_id: currentUserId || 987654321
             };
 
             try {
@@ -300,10 +383,10 @@ MINI_APP_HTML = """
                     closeModal('add-debt-modal');
                     document.getElementById('add-debt-form').reset();
                     loadDataStream();
-                    tg.HapticFeedback.notificationOccurred('success');
+                    if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
                 }
             } catch (err) {
-                alert("Xatolik yuz berdi");
+                alert("Yozuvni kiritishda xatolik yuz berdi");
             }
         }
 
@@ -322,35 +405,35 @@ MINI_APP_HTML = """
                     body: JSON.stringify(payload)
                 });
                 if (res.ok) {
-                    closeModal('payment-modal');
+                    closeModal('profile-drawer');
                     loadDataStream();
-                    tg.HapticFeedback.notificationOccurred('success');
+                    if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
                 } else {
                     const errData = await res.json();
                     alert(errData.error || "Xatolik");
                 }
             } catch (err) {
-                alert("Xatolik yuz berdi");
+                alert("To'lov jarayonida tarmoq xatoligi");
             }
         }
 
         async function submitDeleteDebt() {
             const debtId = document.getElementById('payment-debt-id').value;
-            if(!confirm("Haqiqatan ham ushbu qarzni butunlay o'chirmoqchimisiz?")) return;
+            if (!confirm("Ushbu hisob qaydnomasini va unga tegishli barcha to'lovlar tarixini butunlay o'chirmoqchimisiz?")) return;
             
             try {
                 const res = await fetch(`/api/delete_debt/${debtId}`, { method: 'DELETE' });
-                if(res.ok) {
-                    closeModal('payment-modal');
+                if (res.ok) {
+                    closeModal('profile-drawer');
                     loadDataStream();
-                    tg.HapticFeedback.notificationOccurred('warning');
+                    if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('warning');
                 }
-            } catch(err) {
-                alert("O'chirishda xatolik");
+            } catch (err) {
+                alert("O'chirishda texnik nosozlik");
             }
         }
 
-        // Initialize Context Data Initialization
+        // Initialize Primary Engine Hook Loop
         loadDataStream();
     </script>
 </body>
@@ -364,7 +447,7 @@ def health():
 
 @flask_app.route('/webapp')
 def webapp_interface():
-    """Serves the highly responsive functional Mini App view."""
+    """Serves the highly optimized premium minimalist interface view."""
     return render_template_string(MINI_APP_HTML)
 
 @flask_app.route('/api/dashboard')
@@ -376,16 +459,26 @@ def api_dashboard_metrics():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@flask_app.route('/api/debt_history/<int:debt_id>')
+def api_debt_history(debt_id):
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT amount_paid, payment_date, notes FROM payments WHERE debt_id = ? ORDER BY payment_date DESC", (debt_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        logs = [{"amount_paid": r[0], "payment_date": r[1], "notes": r[2]} for r in rows]
+        return jsonify(logs), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @flask_app.route('/api/add_debt', methods=['POST'])
 def api_add_debt():
     data = request.json or {}
     try:
-        # Validate that the context user exists before creating the record.
-        # If the context execution came via web interface outside a /start flow, 
-        # seamlessly register the user implicitly as a fallback admin.
         seller_id = int(data.get('seller_id', 0))
         if seller_id and not get_user(seller_id):
-            create_user(seller_id, "webapp_user", "Mini App foydalanuvchisi", "admin")
+            create_user(seller_id, "webapp_user", "Mini App Xodimi", "admin")
             
         debt_id = add_debt(
             customer_name=data.get('customer_name', '').strip(),
@@ -409,7 +502,7 @@ def api_pay_debt():
         )
         if success:
             return jsonify({"success": True}), 200
-        return jsonify({"error": "Noto'g'ri to'lov summasi yoki qarz allaqachon yopilgan."}), 400
+        return jsonify({"error": "Noto'g'ri to'lov summasi kiritildi."}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -418,17 +511,42 @@ def api_delete_debt(debt_id):
     try:
         if delete_debt(debt_id):
             return jsonify({"success": True}), 200
-        return jsonify({"error": "Qarz topilmadi"}), 404
+        return jsonify({"error": "Yozuv topilmadi"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------- Persistent Storage Configuration ----------
+@flask_app.route('/api/export_csv')
+def api_export_csv():
+    """Generates an immediate downloadable professional Excel/CSV breakdown report statement."""
+    try:
+        debts = get_all_debts()
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Write statement records meta configuration layout headings
+        writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', 'Boshlang\'ich Qarz', 'Qolgan Balans', 'Eslatma/Izoh', 'Mas\'ul Xodim', 'Sana'])
+        for d in debts:
+            writer.writerow([d['id'], d['customer_name'], d['phone'], d['amount_owed'], d['remaining_balance'], d['notes'], d['seller_name'], d['created_at']])
+            
+        csv_data = output.getvalue()
+        # Return correct spreadsheet download byte streams
+        return Response(
+            csv_data,
+            mimetype="text/csv",
+            headers={"Content-disposition": f"attachment; filename=Qarz_Hisobot_{datetime.now().strftime('%Y%m%d')}.csv"}
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- Persistent Workspace Data Storage Configuration ----------
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
-DATABASE_PATH = os.environ.get('DATABASE_PATH', '/data/debts.db')
 
-# ---------- Text Engine Parser ----------
+# CHANGED: Changed fallback from '/data/debts.db' to local file directory 'debts.db' to bypass system folder permissions block
+DATABASE_PATH = os.environ.get('DATABASE_PATH', 'debts.db')
+
+# ---------- Text Normalization Search Modules ----------
 def normalize_text(text: str) -> str:
     if not text: return ""
     cyrillic_to_latin = {
@@ -445,14 +563,13 @@ def normalize_text(text: str) -> str:
     normalized = unicodedata.normalize('NFKD', normalized).encode('ASCII', 'ignore').decode('ASCII')
     return re.sub(r'[^a-z0-9]', '', normalized)
 
-# ---------- Thread-Safe SQLite Isolation Context ----------
+# ---------- Safe SQLite Context Mapping Connections ----------
 def get_db():
     conn = sqlite3.connect(DATABASE_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 def init_db():
-    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute('''
@@ -495,7 +612,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ---------- Business Logic Controllers ----------
+# ---------- System Logical Controllers Core Backend ----------
 def get_user(telegram_id: int) -> Optional[Dict]:
     conn = get_db()
     cursor = conn.cursor()
@@ -518,22 +635,13 @@ def create_user(telegram_id: int, username: str, first_name: str, role: str) -> 
     finally:
         conn.close()
 
-def delete_user(telegram_id: int) -> bool:
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
-    conn.commit()
-    affected = cursor.rowcount
-    conn.close()
-    return affected > 0
-
 def get_all_users() -> List[Dict]:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, username, first_name, role, created_at FROM users ORDER BY created_at")
+    cursor.execute("SELECT telegram_id, username, first_name, role FROM users")
     rows = cursor.fetchall()
     conn.close()
-    return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3], "created_at": r[4]} for r in rows]
+    return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3]} for r in rows]
 
 def get_admins_and_sellers() -> List[Dict]:
     conn = get_db()
@@ -611,9 +719,8 @@ def get_total_outstanding() -> float:
     conn.close()
     return total
 
-# ---------- Unified Core Keyboards & Handlers ----------
+# ---------- Background Bot Keyboards & Interactive Flows ----------
 def get_main_keyboard(role: str):
-    # Dynamic secure domain injection
     app_host = os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'qarzbot2-1.onrender.com')
     webapp_url = f"https://{app_host}/webapp"
     
@@ -621,14 +728,14 @@ def get_main_keyboard(role: str):
         [InlineKeyboardButton("📱 Ilovani ochish (Mini App)", web_app=WebAppInfo(url=webapp_url))]
     ]
     if role == "admin":
-        keyboard.append([InlineKeyboardButton("👥 Foydalanuvchilar boshqaruvi", callback_data="menu_users")])
+        keyboard.append([InlineKeyboardButton("👥 Xodimlarni boshqarish", callback_data="menu_users")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_users_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Foydalanuvchi qo'shish", callback_data="menu_adduser")],
-        [InlineKeyboardButton("📋 Ro'yxatni ko'rish", callback_data="menu_listusers")],
-        [InlineKeyboardButton("🔙 Orqaga", callback_data="menu_back")]
+        [InlineKeyboardButton("➕ Yangi xodim qo'shish", callback_data="menu_adduser")],
+        [InlineKeyboardButton("📋 Xodimlar ro'yxati", callback_data="menu_listusers")],
+        [InlineKeyboardButton("🔙 Bosh menyuga qaytish", callback_data="menu_back")]
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -640,43 +747,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             create_user(user.id, user.username or "", user.first_name or "", "admin")
             db_user = get_user(user.id)
             await update.message.reply_text(
-                f"✅ Tizim faollashtirildi!\nSiz birinchi foydalanuvchi bo'lganingiz sababli **ADMIN** etib belgilandingiz.\n\n"
-                f"Boshqarish uchun quyidagi tugmani bosing:",
+                f"✅ Tizim faollashtirildi!\nSiz birinchi foydalanuvchi bo'lganingiz sababli tizimda **ADMIN** etib belgilandingiz.\n\n"
+                f"Mini App'ni ishga tushirish uchun pastdagi tugmani bosing:",
                 reply_markup=get_main_keyboard("admin")
             )
         else:
-            await update.message.reply_text("❌ Kirish taqiqlangan. Siz ro'yxatdan o'tmagansiz. Admin bilan bog'laning.")
+            await update.message.reply_text("❌ Kirish taqiqlangan. Tizimda ro'yxatdan o'tmagansiz. Do'kon adminstratoriga murojaat qiling.")
         return
     await update.message.reply_text(
         f"✅ Assalomu alaykum {user.first_name}!\nTizimdagi rolingiz: **{db_user['role'].upper()}**\n\n"
-        f"Ilovani ochish uchun pastdagi tugmani bosing:",
+        f"Boshqaruv interfeysini yuklash uchun pastdagi tugmani bosing:",
         reply_markup=get_main_keyboard(db_user['role'])
     )
 
-NAME, PHONE, AMOUNT, NOTES, DEBT_ID, PAY_AMOUNT, EDIT_FIELD, EDIT_VALUE, SEARCH_QUERY, USER_ID, USER_ROLE = range(11)
+USER_ID, USER_ROLE = range(2)
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     db_user = get_user(query.from_user.id)
     if not db_user or db_user['role'] != 'admin':
-        await query.edit_message_text("Taqiqlangan amal.")
+        await query.edit_message_text("Ushbu amalni bajarish uchun sizda ruxsat etilgan huquqlar mavjud emas.")
         return
     
     if query.data == "menu_users":
-        await query.edit_message_text("👥 **Foydalanuvchilarni boshqarish paneli**", reply_markup=get_users_menu())
+        await query.edit_message_text("👥 **Xodimlarni boshqarish paneli**", reply_markup=get_users_menu())
     elif query.data == "menu_listusers":
         users = get_all_users()
-        msg = "📋 **Tizim foydalanuvchilari:**\n\n"
+        msg = "📋 **Tizim xodimlari ro'yxati:**\n\n"
         for u in users:
-            msg += f"• {u['first_name']} (@{u['username']}) - {u['role']} (ID: `{u['telegram_id']}`)\n"
+            msg += f"• {u['first_name']} (@{u['username']}) — Rol: *{u['role'].upper()}* (ID: `{u['telegram_id']}`)\n"
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_users_menu())
     elif query.data == "menu_adduser":
         context.user_data['action'] = 'adduser'
-        await query.edit_message_text("➕ Yangi foydalanuvchining **Telegram ID** raqamini yuboring:")
+        await query.edit_message_text("➕ Yangi xodimning **Telegram ID** raqamini yuboring:")
         return USER_ID
     elif query.data == "menu_back":
-        await query.edit_message_text("Asosiy boshqaruv menyusi", reply_markup=get_main_keyboard(db_user['role']))
+        await query.edit_message_text("Asosiy boshqaruv paneli menyusi", reply_markup=get_main_keyboard(db_user['role']))
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data.get('action')
@@ -685,24 +792,25 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             telegram_id = int(update.message.text.strip())
             context.user_data['new_user_id'] = telegram_id
             context.user_data['action'] = 'adduser_role'
-            await update.message.reply_text("Foydalanuvchi rolini tanlang (admin / seller / viewer):")
+            await update.message.reply_text("Xodimga beriladigan rolni yozing (admin / seller / viewer):")
             return USER_ROLE
         except ValueError:
-            await update.message.reply_text("Noto'g'ri ID. Raqam yuboring:")
+            await update.message.reply_text("Noto'g'ri format. Raqamlardan iborat Telegram ID yuboring:")
             return USER_ID
             
     elif action == 'adduser_role':
         role = update.message.text.strip().lower()
         if role not in ("admin", "seller", "viewer"):
-            await update.message.reply_text("Noto'g'ri rol. Qayta urinib ko'ring:")
+            await update.message.reply_text("Noto'g'ri tanlov. Faqat bittasini yozing (admin, seller yoki viewer):")
             return USER_ROLE
         tid = context.user_data['new_user_id']
-        create_user(tid, "user", "Xodim", role)
-        await update.message.reply_text(f"✅ Xodim muvaffaqiyatli qo'shildi.")
+        create_user(tid, "xodim_user", "Do'kon xodimi", role)
+        await update.message.reply_text(f"✅ Yangi xodim tizimga muvaffaqiyatli muhrlandi.")
         context.user_data.clear()
         return ConversationHandler.END
 
 def run_telegram_bot():
+    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
@@ -721,7 +829,7 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("help", start))
     app.run_polling(stop_signals=None)
 
-# ---------- Thread-Safe Application Orchestration ----------
+# ---------- Safe Synchronous Orchestration Thread Initialization ----------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     init_db()
