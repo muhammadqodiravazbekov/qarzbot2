@@ -30,16 +30,24 @@ async def start(update, context):
 
 def run_bot():
     token = os.environ.get('BOT_TOKEN')
-    if not token: return
+    if not token: 
+        print("Error: BOT_TOKEN not found!")
+        return
     
-    # We use a separate event loop for the bot thread
-    import asyncio
+    # 1. Create a new event loop for this thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
+    # 2. Build the application
     bot_app = ApplicationBuilder().token(token).build()
     bot_app.add_handler(CommandHandler("start", start))
-    bot_app.run_polling()
+    
+    # 3. Run the application
+    print("Bot is starting...")
+    bot_app.run_polling(drop_pending_updates=True)
+
+# ADD THIS TO THE VERY TOP OF YOUR FILE with your other imports
+import asyncio
 
 # --- Main Initialization ---
 if __name__ == '__main__':
