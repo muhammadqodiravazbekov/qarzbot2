@@ -1,50 +1,52 @@
 import os
 import sqlite3
+import threading
 from flask import Flask, render_template_string, jsonify
 from telegram.ext import ApplicationBuilder, CommandHandler
 
 app = Flask(__name__)
-from werkzeug.middleware.proxy_fix import ProxyFix
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-# --- 1. Bot Initialization ---
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-
-async def start(update, context):
-    await update.message.reply_text("Bot ishlamoqda! Ilovani ochish uchun pastdagi tugmani bosing.")
-
-# --- 2. Routes ---
-@app.route('/')
-def home():
-    return "Bot and WebApp are online!"
-
+# --- Flask Routes ---
 @app.route('/webapp')
 def webapp():
-    # This is your dashboard. I added a simple 'Success' check here.
     return render_template_string("""
     <h1>Boshqaruv Paneli</h1>
     <div id="data">Yuklanmoqda...</div>
     <script>
         fetch('/api/dashboard')
             .then(res => res.json())
-            .then(data => document.getElementById('data').innerText = "Muvaffaqiyatli: " + data.status)
-            .catch(err => document.getElementById('data').innerText = "Xatolik yuz berdi!");
+            .then(data => document.getElementById('data').innerText = "Status: " + data.status)
+            .catch(err => document.getElementById('data').innerText = "Xato!");
     </script>
     """)
 
 @app.route('/api/dashboard')
 def api_dashboard():
-    # Simple check to make sure the API returns JSON
-    return jsonify({"status": "ishlayapti", "data_count": 0})
+    return jsonify({"status": "Bazaga ulanish tayyor"})
 
-# --- 3. Run Both ---
-if __name__ == '__main__':
-    # Start the bot in the background
-    if BOT_TOKEN:
-        bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-        bot_app.add_handler(CommandHandler("start", start))
-        bot_app.run_polling(drop_pending_updates=True)
+# --- Bot Functions ---
+async def start(update, context):
+    await update.message.reply_text("Bot ishlamoqda!")
+
+def run_bot():
+    token = os.environ.get('BOT_TOKEN')
+    if not token: return
     
-    # Start Flask
+    # We use a separate event loop for the bot thread
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    bot_app = ApplicationBuilder().token(token).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.run_polling()
+
+# --- Main Initialization ---
+if __name__ == '__main__':
+    # Start Bot in a background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    # Start Flask in the main thread
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
