@@ -7,6 +7,7 @@ import re
 import unicodedata
 import threading
 import os
+import asyncio
 from datetime import datetime
 from typing import List, Dict, Optional
 from flask import Flask, request, jsonify
@@ -667,6 +668,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
                 return ConversationHandler.END
             context.user_data['new_user_id'] = telegram_id
+            context.user_data['action'] = 'adduser_role'  # Fix: updates action state to read role input correctly next
             await update.message.reply_text("Ролни ёзинг (admin / seller / viewer):")
             return USER_ROLE
         except ValueError:
@@ -761,6 +763,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def run_telegram_bot():
     """This function runs the Telegram bot in a separate thread."""
+    # Setup custom async loop for background thread execution
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(req).build()
 
@@ -787,7 +793,8 @@ def run_telegram_bot():
     app.add_handler(CommandHandler("help", start))
 
     logging.info("Telegram bot started.")
-    app.run_polling()
+    # stop_signals=None prevents background thread signal-handling error crashes on cloud servers
+    app.run_polling(stop_signals=None)
 
 # ---------- Main Entry Point ----------
 if __name__ == "__main__":
