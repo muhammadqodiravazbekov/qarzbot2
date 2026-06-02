@@ -64,7 +64,6 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Created using BIGINT to flawlessly handle larger modern Telegram IDs
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             telegram_id BIGINT PRIMARY KEY,
