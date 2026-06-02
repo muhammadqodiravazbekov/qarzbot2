@@ -1,4 +1,3 @@
-import sqlite3
 import logging
 import csv
 import io
@@ -16,11 +15,13 @@ from telegram.ext import (
     MessageHandler, CallbackQueryHandler, filters, ContextTypes
 )
 from telegram.request import HTTPXRequest
+import psycopg2
+import psycopg2.extras
+from psycopg2 import sql
 
 # ---------- Flask Web Server & Mini App Frontend ----------
 flask_app = Flask(__name__)
 
-# Premium Ultra-Minimalist UI Design using Tailwind CSS
 MINI_APP_HTML = """
 <!DOCTYPE html>
 <html lang="uz">
@@ -281,8 +282,8 @@ MINI_APP_HTML = """
                 document.getElementById('loading-spinner').classList.add('hidden');
                 document.getElementById('records-container').classList.remove('hidden');
             } catch (err) {
-                console.error("Critical Storage Interrupt Error:", err);
-                document.getElementById('loading-spinner').innerText = "Ma'lumot uzatish tarmog'ida uzilish yuz berdi.";
+                console.error("Dashboard load error:", err);
+                document.getElementById('loading-spinner').innerText = "Ma'lumot uzatish tarmog'ida uzilish yuz berdi. Sahifani yangilang.";
             }
         }
 
@@ -299,12 +300,12 @@ MINI_APP_HTML = """
                 const isSettled = item.remaining_balance <= 0;
                 const element = document.createElement('div');
                 element.className = `bg-white border ${isSettled ? 'border-slate-100 opacity-60' : 'border-slate-200/50'} p-3.5 rounded-xl shadow-xs flex justify-between items-center transition-all active:scale-[0.99] cursor-pointer hover:border-indigo-100`;
-                element.setAttribute('onclick', `openProfileDrawer(${item.id}, "${item.customer_name}", "${item.phone}", ${item.remaining_balance}, ${item.amount_owed}, "${item.notes || ''}")`);
+                element.setAttribute('onclick', `openProfileDrawer(${item.id}, "${(item.customer_name||'').replace(/"/g,'&quot;')}", "${(item.phone||'').replace(/"/g,'&quot;')}", ${item.remaining_balance}, ${item.amount_owed}, "${(item.notes||'').replace(/"/g,'&quot;')}")`);
                 
                 element.innerHTML = `
                     <div class="space-y-0.5 max-w-[65%]">
                         <h4 class="font-bold text-slate-800 text-xs tracking-tight truncate">${item.customer_name}</h4>
-                        <p class="text-[10px] text-slate-400 font-medium">${item.phone ? '📞 ' + item.phone : '📞 Rafqam kiritilmagan'}</p>
+                        <p class="text-[10px] text-slate-400 font-medium">${item.phone ? '📞 ' + item.phone : '📞 Raqam kiritilmagan'}</p>
                         ${item.notes ? `<p class="text-[10px] text-slate-500 bg-slate-50 inline-block px-2 py-0.5 rounded-md border border-slate-100/70 mt-1 truncate max-w-full">${item.notes}</p>` : ''}
                     </div>
                     <div class="text-right">
@@ -339,13 +340,8 @@ MINI_APP_HTML = """
 
         function applyFiltersAndSearch(query, filter) {
             let filtered = rawDebtsData;
-            
-            if (filter === 'active') {
-                filtered = filtered.filter(d => d.remaining_balance > 0);
-            } else if (filter === 'settled') {
-                filtered = filtered.filter(d => d.remaining_balance <= 0);
-            }
-            
+            if (filter === 'active') filtered = filtered.filter(d => d.remaining_balance > 0);
+            else if (filter === 'settled') filtered = filtered.filter(d => d.remaining_balance <= 0);
             if (query) {
                 filtered = filtered.filter(d => 
                     d.customer_name.toLowerCase().includes(query) || 
@@ -357,28 +353,36 @@ MINI_APP_HTML = """
 
         async function submitAddDebt(e) {
             e.preventDefault();
+            const btn = e.target.querySelector('button[type=submit]');
+            btn.disabled = true;
+            btn.innerText = 'Saqlanmoqda...';
             const payload = {
                 customer_name: document.getElementById('form-name').value,
                 phone: document.getElementById('form-phone').value,
                 amount: parseFloat(document.getElementById('form-amount').value),
                 notes: document.getElementById('form-notes').value,
-                seller_id: currentUserId || 987654321
+                seller_id: currentUserId || 0
             };
-
             try {
                 const res = await fetch('/api/add_debt', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
+                const result = await res.json();
                 if (res.ok) {
                     closeModal('add-debt-modal');
                     document.getElementById('add-debt-form').reset();
                     loadDataStream();
                     if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+                } else {
+                    alert(result.error || "Xatolik yuz berdi");
                 }
             } catch (err) {
-                alert("Yozuvni kiritishda xatolik yuz berdi");
+                alert("Yozuvni kiritishda tarmoq xatoligi: " + err.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'Tizimga saqlash';
             }
         }
 
@@ -389,7 +393,6 @@ MINI_APP_HTML = """
                 amount: parseFloat(document.getElementById('payment-amount').value),
                 notes: document.getElementById('payment-notes').value
             };
-
             try {
                 const res = await fetch('/api/pay_debt', {
                     method: 'POST',
@@ -412,7 +415,6 @@ MINI_APP_HTML = """
         async function submitDeleteDebt() {
             const debtId = document.getElementById('payment-debt-id').value;
             if (!confirm("Ushbu hisob qaydnomasini va unga tegishli barcha to'lovlar tarixini butunlay o'chirmoqchimisiz?")) return;
-            
             try {
                 const res = await fetch(`/api/delete_debt/${debtId}`, { method: 'DELETE' });
                 if (res.ok) {
@@ -431,6 +433,203 @@ MINI_APP_HTML = """
 </html>
 """
 
+# ---------- Configuration ----------
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required!")
+
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is required! Set your Neon PostgreSQL connection string.")
+
+# ---------- PostgreSQL Connection ----------
+def get_db():
+    """Return a new psycopg2 connection to Neon PostgreSQL."""
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    return conn
+
+# ---------- Database Initialisation ----------
+def init_db():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            role TEXT CHECK(role IN ('admin','seller','viewer')) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS debts (
+            id SERIAL PRIMARY KEY,
+            customer_name TEXT NOT NULL,
+            customer_name_normalized TEXT,
+            phone TEXT,
+            amount_owed REAL NOT NULL,
+            remaining_balance REAL NOT NULL,
+            notes TEXT,
+            seller_telegram_id BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_debt_name_normalized ON debts(customer_name_normalized)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_debt_phone ON debts(phone)')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payments (
+            id SERIAL PRIMARY KEY,
+            debt_id INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
+            amount_paid REAL NOT NULL,
+            payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT
+        )
+    ''')
+    cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+    conn.commit()
+    cursor.close()
+    conn.close()
+    logging.info("Database initialised successfully.")
+
+# ---------- Text Normalisation ----------
+def normalize_text(text: str) -> str:
+    if not text: return ""
+    cyrillic_to_latin = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+        'ў': "o'", 'қ': 'q', 'ғ': "g'", 'ҳ': 'h', 'нг': 'ng'
+    }
+    normalized = text.lower()
+    for cyr, lat in cyrillic_to_latin.items():
+        normalized = normalized.replace(cyr, lat)
+    normalized = unicodedata.normalize('NFKD', normalized).encode('ASCII', 'ignore').decode('ASCII')
+    return re.sub(r'[^a-z0-9]', '', normalized)
+
+# ---------- DB Helper Functions ----------
+def get_user(telegram_id: int) -> Optional[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_id, username, first_name, role FROM users WHERE telegram_id = %s", (telegram_id,))
+    row = cursor.fetchone()
+    cursor.close(); conn.close()
+    if row:
+        return {"telegram_id": row[0], "username": row[1], "first_name": row[2], "role": row[3]}
+    return None
+
+def create_user(telegram_id: int, username: str, first_name: str, role: str) -> bool:
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO users (telegram_id, username, first_name, role) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
+            (telegram_id, username, first_name, role)
+        )
+        conn.commit()
+        cursor.close()
+        return True
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"create_user error: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_all_users() -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_id, username, first_name, role FROM users")
+    rows = cursor.fetchall()
+    cursor.close(); conn.close()
+    return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3]} for r in rows]
+
+def get_admins_and_sellers() -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_id, username, first_name, role FROM users WHERE role IN ('admin','seller')")
+    rows = cursor.fetchall()
+    cursor.close(); conn.close()
+    return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3]} for r in rows]
+
+def add_debt(customer_name: str, phone: str, amount: float, notes: str, seller_telegram_id: int) -> int:
+    norm_name = normalize_text(customer_name)
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO debts (customer_name, customer_name_normalized, phone, amount_owed, remaining_balance, notes, seller_telegram_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (customer_name, norm_name, phone, amount, amount, notes, seller_telegram_id)
+    )
+    debt_id = cursor.fetchone()[0]
+    conn.commit()
+    cursor.close(); conn.close()
+    return debt_id
+
+def get_debt(debt_id: int) -> Optional[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, customer_name, phone, amount_owed, remaining_balance, notes, seller_telegram_id FROM debts WHERE id = %s", (debt_id,))
+    row = cursor.fetchone()
+    cursor.close(); conn.close()
+    if row:
+        return {"id": row[0], "customer_name": row[1], "phone": row[2], "amount_owed": row[3], "remaining_balance": row[4], "notes": row[5], "seller_telegram_id": row[6]}
+    return None
+
+def delete_debt(debt_id: int) -> bool:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM debts WHERE id = %s", (debt_id,))
+    conn.commit()
+    affected = cursor.rowcount
+    cursor.close(); conn.close()
+    return affected > 0
+
+def add_payment(debt_id: int, amount: float, notes: str = "") -> bool:
+    debt = get_debt(debt_id)
+    if not debt or amount <= 0 or amount > debt["remaining_balance"]:
+        return False
+    new_balance = round(debt["remaining_balance"] - amount, 2)
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO payments (debt_id, amount_paid, notes) VALUES (%s, %s, %s)", (debt_id, amount, notes))
+    cursor.execute("UPDATE debts SET remaining_balance = %s, updated_at = %s WHERE id = %s", (new_balance, datetime.now(), debt_id))
+    conn.commit()
+    cursor.close(); conn.close()
+    return True
+
+def get_all_debts() -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    # LEFT JOIN so debts always show even if seller user record is missing
+    cursor.execute("""
+        SELECT d.id, d.customer_name, d.phone, d.amount_owed, d.remaining_balance, d.notes,
+               d.seller_telegram_id, d.created_at, u.username, u.first_name
+        FROM debts d
+        LEFT JOIN users u ON d.seller_telegram_id = u.telegram_id
+        ORDER BY d.remaining_balance DESC, d.created_at DESC
+    """)
+    rows = cursor.fetchall()
+    cursor.close(); conn.close()
+    return [{
+        "id": r[0], "customer_name": r[1], "phone": r[2] or "",
+        "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5] or "",
+        "seller_telegram_id": r[6],
+        "created_at": str(r[7]),
+        "seller_name": r[8] or r[9] or str(r[6])
+    } for r in rows]
+
+def get_total_outstanding() -> float:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COALESCE(SUM(remaining_balance), 0) FROM debts")
+    total = cursor.fetchone()[0]
+    cursor.close(); conn.close()
+    return float(total)
+
+# ---------- Flask Routes ----------
 @flask_app.route('/')
 @flask_app.route('/health')
 def health():
@@ -447,6 +646,7 @@ def api_dashboard_metrics():
         debts = get_all_debts()
         return jsonify({"total_outstanding": total, "debts": debts})
     except Exception as e:
+        logging.error(f"Dashboard error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @flask_app.route('/api/debt_history/<int:debt_id>')
@@ -454,34 +654,44 @@ def api_debt_history(debt_id):
     try:
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT amount_paid, payment_date, notes FROM payments WHERE debt_id = ? ORDER BY payment_date DESC", (debt_id,))
+        cursor.execute("SELECT amount_paid, payment_date, notes FROM payments WHERE debt_id = %s ORDER BY payment_date DESC", (debt_id,))
         rows = cursor.fetchall()
-        conn.close()
-        logs = [{"amount_paid": r[0], "payment_date": r[1], "notes": r[2]} for r in rows]
+        cursor.close(); conn.close()
+        logs = [{"amount_paid": r[0], "payment_date": str(r[1]), "notes": r[2]} for r in rows]
         return jsonify(logs), 200
     except Exception as e:
+        logging.error(f"Debt history error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @flask_app.route('/api/add_debt', methods=['POST'])
 def api_add_debt():
     data = request.json or {}
     try:
-        seller_id = int(data.get('seller_id', 0))
-        if not seller_id:
-            # Opened outside Telegram (e.g. browser) — use a default admin account
-            seller_id = 1
-        if not get_user(seller_id):
+        seller_id = int(data.get('seller_id') or 0)
+        # Ensure a valid user exists for this seller_id
+        if seller_id and not get_user(seller_id):
             create_user(seller_id, "webapp_user", "Mini App Xodimi", "admin")
-            
+        elif not seller_id:
+            # Opened outside Telegram — use or create a default admin
+            seller_id = 1
+            if not get_user(seller_id):
+                create_user(seller_id, "default_admin", "Administrator", "admin")
+
+        name = data.get('customer_name', '').strip()
+        amount = float(data.get('amount', 0))
+        if not name or amount <= 0:
+            return jsonify({"error": "Ism va summa majburiy maydonlar!"}), 400
+
         debt_id = add_debt(
-            customer_name=data.get('customer_name', '').strip(),
+            customer_name=name,
             phone=data.get('phone', '').strip(),
-            amount=float(data.get('amount', 0)),
+            amount=amount,
             notes=data.get('notes', '').strip(),
             seller_telegram_id=seller_id
         )
         return jsonify({"success": True, "debt_id": debt_id}), 200
     except Exception as e:
+        logging.error(f"add_debt error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 400
 
 @flask_app.route('/api/pay_debt', methods=['POST'])
@@ -497,6 +707,7 @@ def api_pay_debt():
             return jsonify({"success": True}), 200
         return jsonify({"error": "Noto'g'ri to'lov summasi kiritildi."}), 400
     except Exception as e:
+        logging.error(f"pay_debt error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @flask_app.route('/api/delete_debt/<int:debt_id>', methods=['DELETE'])
@@ -506,6 +717,7 @@ def api_delete_debt(debt_id):
             return jsonify({"success": True}), 200
         return jsonify({"error": "Yozuv topilmadi"}), 404
     except Exception as e:
+        logging.error(f"delete_debt error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @flask_app.route('/api/export_csv')
@@ -514,19 +726,17 @@ def api_export_csv():
         debts = get_all_debts()
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', 'Boshlang\'ich Qarz', 'Qolgan Balans', 'Eslatma/Izoh', 'Mas\'ul Xodim', 'Sana'])
+        writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', "Boshlang'ich Qarz", 'Qolgan Balans', 'Eslatma/Izoh', "Mas'ul Xodim", 'Sana'])
         for d in debts:
             writer.writerow([d['id'], d['customer_name'], d['phone'], d['amount_owed'], d['remaining_balance'], d['notes'], d['seller_name'], d['created_at']])
-        csv_data = output.getvalue()
         return Response(
-            csv_data,
+            output.getvalue(),
             mimetype="text/csv",
             headers={"Content-disposition": f"attachment; filename=Qarz_Hisobot_{datetime.now().strftime('%Y%m%d')}.csv"}
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# NEW FEATURE: Secure Automated End-of-Day Group Backup Hook
 @flask_app.route('/api/trigger_backup', methods=['GET', 'POST'])
 def api_trigger_backup():
     group_id = os.environ.get('BACKUP_GROUP_ID')
@@ -536,18 +746,15 @@ def api_trigger_backup():
         debts = get_all_debts()
         total_outstanding = get_total_outstanding()
         active_count = len([d for d in debts if d['remaining_balance'] > 0])
-        
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', 'Boshlang\'ich Qarz', 'Qolgan Balans', 'Eslatma/Izoh', 'Mas\'ul Xodim', 'Sana'])
+        writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', "Boshlang'ich Qarz", 'Qolgan Balans', 'Eslatma/Izoh', "Mas'ul Xodim", 'Sana'])
         for d in debts:
             writer.writerow([d['id'], d['customer_name'], d['phone'], d['amount_owed'], d['remaining_balance'], d['notes'], d['seller_name'], d['created_at']])
-        
         csv_bytes = output.getvalue().encode('utf-8')
         file_stream = io.BytesIO(csv_bytes)
-        file_stream.name = f"Supermarket_Qarz_Backup_{datetime.now().strftime('%Y_%m_%d')}.csv"
-        
-        # Async invocation container inside standalone Flask request threads
+        file_stream.name = f"Qarz_Backup_{datetime.now().strftime('%Y_%m_%d')}.csv"
+
         async def send_file_to_group():
             bot = Bot(token=BOT_TOKEN)
             async with bot:
@@ -555,208 +762,24 @@ def api_trigger_backup():
                     chat_id=int(group_id),
                     document=file_stream,
                     caption=(
-                        f"📁 **KUNLIK AVTOMATIK BACKUP HISOBOTI**\n"
-                        f"📆 Sana: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-                        f"📊 **Do'kon Ko'rsatkichlari:**\n"
-                        f"• Jami bozordagi qarz: {total_outstanding:,.0f} UZS\n"
-                        f"• Faol qarzdorlar soni: {active_count} ta\n\n"
-                        f"🔒 *Ushbu ma'lumotlar bazasi zaxira nusxasi avtomatik ravishda saqlandi.*"
-                    )
+                        f"📁 *KUNLIK AVTOMATIK BACKUP*\n"
+                        f"📆 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                        f"• Jami qarz: {total_outstanding:,.0f} UZS\n"
+                        f"• Faol qarzdorlar: {active_count} ta"
+                    ),
+                    parse_mode="Markdown"
                 )
-        
         asyncio.run(send_file_to_group())
-        return jsonify({"success": True, "message": "Backup pushed to Telegram group successfully."}), 200
+        return jsonify({"success": True}), 200
     except Exception as e:
+        logging.error(f"backup error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-# ---------- Persistent Workspace Data Storage Configuration ----------
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is required!")
-
-DATABASE_PATH = os.environ.get('DATABASE_PATH', 'debts.db')
-
-# ---------- Text Normalization Search Modules ----------
-def normalize_text(text: str) -> str:
-    if not text: return ""
-    cyrillic_to_latin = {
-        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
-        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
-        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-        'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
-        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
-        'ў': 'o\'', 'қ': 'q', 'ғ': 'g\'', 'ҳ': 'h', 'нг': 'ng'
-    }
-    normalized = text.lower()
-    for cyr, lat in cyrillic_to_latin.items():
-        normalized = normalized.replace(cyr, lat)
-    normalized = unicodedata.normalize('NFKD', normalized).encode('ASCII', 'ignore').decode('ASCII')
-    return re.sub(r'[^a-z0-9]', '', normalized)
-
-# ---------- Safe SQLite Context Mapping Connections ----------
-def get_db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-def init_db():
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            role TEXT CHECK(role IN ('admin','seller','viewer')) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS debts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_name TEXT NOT NULL,
-            customer_name_normalized TEXT,
-            phone TEXT,
-            amount_owed REAL NOT NULL,
-            remaining_balance REAL NOT NULL,
-            notes TEXT,
-            seller_telegram_id INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (seller_telegram_id) REFERENCES users(telegram_id)
-        )
-    ''')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_debt_name_normalized ON debts(customer_name_normalized)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_debt_phone ON debts(phone)')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            debt_id INTEGER NOT NULL,
-            amount_paid REAL NOT NULL,
-            payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            notes TEXT,
-            FOREIGN KEY (debt_id) REFERENCES debts(id) ON DELETE CASCADE
-        )
-    ''')
-    cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
-    conn.commit()
-    conn.close()
-
-# ---------- System Logical Controllers Core Backend ----------
-def get_user(telegram_id: int) -> Optional[Dict]:
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, username, first_name, role FROM users WHERE telegram_id = ?", (telegram_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row: return {"telegram_id": row[0], "username": row[1], "first_name": row[2], "role": row[3]}
-    return None
-
-def create_user(telegram_id: int, username: str, first_name: str, role: str) -> bool:
-    conn = get_db()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO users (telegram_id, username, first_name, role) VALUES (?, ?, ?, ?)",
-                       (telegram_id, username, first_name, role))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-def get_all_users() -> List[Dict]:
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, username, first_name, role FROM users")
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3]} for r in rows]
-
-def get_admins_and_sellers() -> List[Dict]:
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, username, first_name, role FROM users WHERE role IN ('admin','seller')")
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3]} for r in rows]
-
-def add_debt(customer_name: str, phone: str, amount: float, notes: str, seller_telegram_id: int) -> int:
-    norm_name = normalize_text(customer_name)
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO debts (customer_name, customer_name_normalized, phone, amount_owed, remaining_balance, notes, seller_telegram_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (customer_name, norm_name, phone, amount, amount, notes, seller_telegram_id)
-    )
-    debt_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return debt_id
-
-def get_debt(debt_id: int) -> Optional[Dict]:
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, customer_name, phone, amount_owed, remaining_balance, notes, seller_telegram_id FROM debts WHERE id = ?", (debt_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row: return {"id": row[0], "customer_name": row[1], "phone": row[2], "amount_owed": row[3], "remaining_balance": row[4], "notes": row[5], "seller_telegram_id": row[6]}
-    return None
-
-def delete_debt(debt_id: int) -> bool:
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM debts WHERE id = ?", (debt_id,))
-    conn.commit()
-    affected = cursor.rowcount
-    conn.close()
-    return affected > 0
-
-def add_payment(debt_id: int, amount: float, notes: str = "") -> bool:
-    debt = get_debt(debt_id)
-    if not debt or amount <= 0 or amount > debt["remaining_balance"]:
-        return False
-    new_balance = debt["remaining_balance"] - amount
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO payments (debt_id, amount_paid, notes) VALUES (?, ?, ?)", (debt_id, amount, notes))
-    cursor.execute("UPDATE debts SET remaining_balance = ?, updated_at = ? WHERE id = ?", (new_balance, datetime.now().isoformat(), debt_id))
-    conn.commit()
-    conn.close()
-    return True
-
-def get_all_debts() -> List[Dict]:
-    query = """
-        SELECT d.id, d.customer_name, d.phone, d.amount_owed, d.remaining_balance, d.notes,
-               d.seller_telegram_id, d.created_at, u.username, u.first_name
-        FROM debts d
-        LEFT JOIN users u ON d.seller_telegram_id = u.telegram_id
-        ORDER BY d.remaining_balance DESC, d.created_at DESC
-    """
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(query)
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"id": r[0], "customer_name": r[1], "phone": r[2], "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5], "seller_telegram_id": r[6], "created_at": r[7], "seller_name": r[8] or r[9] or str(r[6])} for r in rows]
-
-def get_total_outstanding() -> float:
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COALESCE(SUM(remaining_balance), 0) FROM debts")
-    total = cursor.fetchone()[0]
-    conn.close()
-    return total
-
-# ---------- Background Bot Keyboards & Interactive Flows ----------
+# ---------- Telegram Bot ----------
 def get_main_keyboard(role: str):
-    app_host = os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'qarzbot2-1.onrender.com')
+    app_host = os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'localhost:5000')
     webapp_url = f"https://{app_host}/webapp"
-    
-    keyboard = [
-        [InlineKeyboardButton("📱 Ilovani ochish (Mini App)", web_app=WebAppInfo(url=webapp_url))]
-    ]
+    keyboard = [[InlineKeyboardButton("📱 Ilovani ochish (Mini App)", web_app=WebAppInfo(url=webapp_url))]]
     if role == "admin":
         keyboard.append([InlineKeyboardButton("👥 Xodimlarni boshqarish", callback_data="menu_users")])
     return InlineKeyboardMarkup(keyboard)
@@ -777,16 +800,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             create_user(user.id, user.username or "", user.first_name or "", "admin")
             db_user = get_user(user.id)
             await update.message.reply_text(
-                f"✅ Tizim faollashtirildi!\nSiz birinchi foydalanuvchi bo'lganingiz sababli tizimda **ADMIN** etib belgilandingiz.\n\n"
+                f"✅ Tizim faollashtirildi!\nSiz birinchi foydalanuvchi bo'lganingiz sababli *ADMIN* etib belgilandingiz.\n\n"
                 f"Mini App'ni ishga tushirish uchun pastdagi tugmani bosing:",
+                parse_mode="Markdown",
                 reply_markup=get_main_keyboard("admin")
             )
         else:
-            await update.message.reply_text("❌ Kirish taqiqlangan. Tizimda ro'yxatdan o'tmagansiz. Do'kon adminstratoriga murojaat qiling.")
+            await update.message.reply_text("❌ Kirish taqiqlangan. Administrator bilan bog'laning.")
         return
     await update.message.reply_text(
-        f"✅ Assalomu alaykum {user.first_name}!\nTizimdagi rolingiz: **{db_user['role'].upper()}**\n\n"
-        f"Boshqaruv interfeysini yuklash uchun pastdagi tugmani bosing:",
+        f"✅ Assalomu alaykum {user.first_name}!\nRolingiz: *{db_user['role'].upper()}*\n\nIlovani ochish uchun pastdagi tugmani bosing:",
+        parse_mode="Markdown",
         reply_markup=get_main_keyboard(db_user['role'])
     )
 
@@ -797,23 +821,24 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     db_user = get_user(query.from_user.id)
     if not db_user or db_user['role'] != 'admin':
-        await query.edit_message_text("Ushbu amalni bajarish uchun sizda ruxsat etilgan huquqlar mavjud emas.")
-        return
-    
+        await query.edit_message_text("Sizda bu amalni bajarish uchun ruxsat yo'q.")
+        return ConversationHandler.END
+
     if query.data == "menu_users":
-        await query.edit_message_text("👥 **Xodimlarni boshqarish paneli**", reply_markup=get_users_menu())
+        await query.edit_message_text("👥 *Xodimlarni boshqarish paneli*", parse_mode="Markdown", reply_markup=get_users_menu())
     elif query.data == "menu_listusers":
         users = get_all_users()
-        msg = "📋 **Tizim xodimlari ro'yxati:**\n\n"
+        msg = "📋 *Tizim xodimlari:*\n\n"
         for u in users:
-            msg += f"• {u['first_name']} (@{u['username']}) — Rol: *{u['role'].upper()}* (ID: `{u['telegram_id']}`)\n"
+            msg += f"• {u['first_name']} (@{u['username'] or '-'}) — *{u['role'].upper()}* (ID: `{u['telegram_id']}`)\n"
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_users_menu())
     elif query.data == "menu_adduser":
         context.user_data['action'] = 'adduser'
-        await query.edit_message_text("➕ Yangi xodimning **Telegram ID** raqamini yuboring:")
+        await query.edit_message_text("➕ Yangi xodimning *Telegram ID* raqamini yuboring:", parse_mode="Markdown")
         return USER_ID
     elif query.data == "menu_back":
-        await query.edit_message_text("Asosiy boshqaruv paneli menyusi", reply_markup=get_main_keyboard(db_user['role']))
+        await query.edit_message_text("Asosiy menyu:", reply_markup=get_main_keyboard(db_user['role']))
+    return ConversationHandler.END
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data.get('action')
@@ -825,27 +850,24 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Xodimga beriladigan rolni yozing (admin / seller / viewer):")
             return USER_ROLE
         except ValueError:
-            await update.message.reply_text("Noto'g'ri format. Raqamlardan iborat Telegram ID yuboring:")
+            await update.message.reply_text("Noto'g'ri format. Raqamli Telegram ID yuboring:")
             return USER_ID
-            
     elif action == 'adduser_role':
         role = update.message.text.strip().lower()
         if role not in ("admin", "seller", "viewer"):
-            await update.message.reply_text("Noto'g'ri tanlov. Faqat bittasini yozing (admin, seller yoki viewer):")
+            await update.message.reply_text("Noto'g'ri tanlov. Faqat (admin, seller yoki viewer) yozing:")
             return USER_ROLE
         tid = context.user_data['new_user_id']
-        create_user(tid, "xodim_user", "Do'kon xodimi", role)
-        await update.message.reply_text(f"✅ Yangi xodim tizimga muvaffaqiyatli muhrlandi.")
+        create_user(tid, "", "Do'kon xodimi", role)
+        await update.message.reply_text(f"✅ Yangi xodim (ID: {tid}) tizimga qo'shildi, roli: {role.upper()}")
         context.user_data.clear()
         return ConversationHandler.END
 
 def run_telegram_bot():
-    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(req).build()
-
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_handler)],
         states={
@@ -857,16 +879,15 @@ def run_telegram_bot():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
+    logging.info("Telegram bot started.")
     app.run_polling(stop_signals=None)
 
-# ---------- Safe Synchronous Orchestration Thread Initialization ----------
+# ---------- Entry Point ----------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     init_db()
-    
-    bot_thread = threading.Thread(target=run_telegram_bot)
-    bot_thread.daemon = True
+    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
     bot_thread.start()
-    
     port = int(os.environ.get('PORT', 5000))
+    logging.info(f"Starting Flask on port {port}")
     flask_app.run(host='0.0.0.0', port=port)
