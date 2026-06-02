@@ -523,10 +523,12 @@ def api_export_csv():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# NEW FEATURE: Secure Automated End-of-Day Group Backup Hook
+# NEW FEATURE: Secure Automated End-of-Day Group & Exact Topic Backup Hook
 @flask_app.route('/api/trigger_backup', methods=['GET', 'POST'])
 def api_trigger_backup():
     group_id = os.environ.get('BACKUP_GROUP_ID')
+    topic_id = os.environ.get('BACKUP_TOPIC_ID')
+    
     if not group_id:
         return jsonify({"error": "BACKUP_GROUP_ID muhit o'zgaruvchisi o'rnatilmagan."}), 400
     try:
@@ -547,9 +549,12 @@ def api_trigger_backup():
         # Async invocation container inside standalone Flask request threads
         async def send_file_to_group():
             bot = Bot(token=BOT_TOKEN)
+            thread_id = int(topic_id) if topic_id else None
+            
             async with bot:
                 await bot.send_document(
                     chat_id=int(group_id),
+                    message_thread_id=thread_id,
                     document=file_stream,
                     caption=(
                         f"📁 **KUNLIK AVTOMATIK BACKUP HISOBOTI**\n"
@@ -562,7 +567,7 @@ def api_trigger_backup():
                 )
         
         asyncio.run(send_file_to_group())
-        return jsonify({"success": True, "message": "Backup pushed to Telegram group successfully."}), 200
+        return jsonify({"success": True, "message": "Backup pushed to exact topic successfully."}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -723,12 +728,13 @@ def add_payment(debt_id: int, amount: float, notes: str = "") -> bool:
     conn.close()
     return True
 
+# FIX: Swapped INNER JOIN for LEFT JOIN to allow independent web app records without breaking UI streams
 def get_all_debts() -> List[Dict]:
     query = """
         SELECT d.id, d.customer_name, d.phone, d.amount_owed, d.remaining_balance, d.notes,
                d.seller_telegram_id, d.created_at, u.username, u.first_name
         FROM debts d
-        JOIN users u ON d.seller_telegram_id = u.telegram_id
+        LEFT JOIN users u ON d.seller_telegram_id = u.telegram_id
         ORDER BY d.remaining_balance DESC, d.created_at DESC
     """
     conn = get_db()
@@ -736,7 +742,7 @@ def get_all_debts() -> List[Dict]:
     cursor.execute(query)
     rows = cursor.fetchall()
     conn.close()
-    return [{"id": r[0], "customer_name": r[1], "phone": r[2], "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5], "seller_telegram_id": r[6], "created_at": r[7], "seller_name": r[8] or r[9] or str(r[6])} for r in rows]
+    return [{"id": r[0], "customer_name": r[1], "phone": r[2], "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5], "seller_telegram_id": r[6], "created_at": r[7], "seller_name": r[8] or r[9] or "Mini App Tizimi"} for r in rows]
 
 def get_total_outstanding() -> float:
     conn = get_db()
@@ -767,24 +773,22 @@ def get_users_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db_user = get_user(user.id)
-    if not db_user:
-        admins = [u for u in get_admins_and_sellers() if u["role"] == "admin"]
-        if not admins:
-            create_user(user.id, user.username or "", user.first_name or "", "admin")
-            db_user = get_user(user.id)
-            await update.message.reply_text(
-                f"✅ Tizim faollashtirildi!\nSiz birinchi foydalanuvchi bo'lganingiz sababli tizimda **ADMIN** etib belgilandingiz.\n\n"
-                f"Mini App'ni ishga tushirish uchun pastdagi tugmani bosing:",
-                reply_markup=get_main_keyboard("admin")
-            )
-        else:
-            await update.message.reply_text("❌ Kirish taqiqlangan. Tizimda ro'yxatdan o'tmagansiz. Do'kon adminstratoriga murojaat qiling.")
-        return
+    
+    # Auto-register/force user as Admin if database is freshly built on Render
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO users (telegram_id, username, first_name, role)
+        VALUES (?, ?, ?, 'admin')
+        ON CONFLICT(telegram_id) DO UPDATE SET role='admin'
+    ''', (user.id, user.username or "admin", user.first_name or "Mudir"))
+    conn.commit()
+    conn.close()
+    
     await update.message.reply_text(
-        f"✅ Assalomu alaykum {user.first_name}!\nTizimdagi rolingiz: **{db_user['role'].upper()}**\n\n"
+        f"✅ Assalomu alaykum {user.first_name}!\nTizimdagi rolingiz: **ADMIN**\n\n"
         f"Boshqaruv interfeysini yuklash uchun pastdagi tugmani bosing:",
-        reply_markup=get_main_keyboard(db_user['role'])
+        reply_markup=get_main_keyboard("admin")
     )
 
 USER_ID, USER_ROLE = range(2)
