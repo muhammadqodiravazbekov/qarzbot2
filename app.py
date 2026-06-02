@@ -1,3 +1,5 @@
+# Import the standard library and third-party modules
+import psycopg2
 import logging
 import csv
 import io
@@ -8,430 +10,21 @@ import os
 import asyncio
 from datetime import datetime
 from typing import List, Dict, Optional
-from flask import Flask, request, jsonify, render_template_string, Response
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, Bot
+from flask import Flask, request, jsonify
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
     MessageHandler, CallbackQueryHandler, filters, ContextTypes
 )
 from telegram.request import HTTPXRequest
-import psycopg2
-import psycopg2.extras
-from psycopg2 import sql
 
-# ---------- Flask Web Server & Mini App Frontend ----------
+# ---------- Flask Web Server ----------
 flask_app = Flask(__name__)
 
-MINI_APP_HTML = """
-<!DOCTYPE html>
-<html lang="uz">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Qarz Kontrol</title>
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <style>
-        body { -webkit-tap-highlight-color: transparent; }
-        .no-scrollbar::-webkit-scrollbar { display: none; }
-    </style>
-</head>
-<body class="bg-[#f8fafc] text-[#0f172a] font-sans antialiased pb-24 selection:bg-indigo-50">
-
-    <div class="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-slate-100 px-4 py-3.5 flex items-center justify-between">
-        <div>
-            <h1 class="text-base font-bold tracking-tight text-slate-900 flex items-center gap-1.5">
-                <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                <span id="user-greeting">Boshqaruv Paneli</span>
-            </h1>
-            <p class="text-[11px] text-slate-400 font-medium" id="current-date">Yuklanmoqda...</p>
-        </div>
-        <div class="flex items-center gap-2">
-            <a href="/api/export_csv" target="_blank" class="p-2 text-slate-500 hover:text-slate-700 bg-slate-100 rounded-xl transition-all active:scale-95" title="Hisobot yuklash">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-            </a>
-            <button onclick="openModal('add-debt-modal')" class="bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white px-3.5 py-1.5 rounded-xl text-xs font-semibold shadow-sm transition-all">
-                + Yangi Qarz
-            </button>
-        </div>
-    </div>
-
-    <div class="max-w-md mx-auto p-4 space-y-4">
-        
-        <div class="grid grid-cols-3 gap-2">
-            <div class="bg-white border border-slate-100 p-3 rounded-2xl shadow-sm">
-                <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Umumiy Qarz</span>
-                <span id="total-amount" class="text-sm font-extrabold text-slate-900 block mt-0.5 truncate">0 UZS</span>
-            </div>
-            <div class="bg-white border border-slate-100 p-3 rounded-2xl shadow-sm">
-                <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Faol Mijozlar</span>
-                <span id="total-debtors" class="text-sm font-extrabold text-indigo-600 block mt-0.5">0 ta</span>
-            </div>
-            <div class="bg-white border border-slate-100 p-3 rounded-2xl shadow-sm">
-                <span class="text-[9px] font-bold text-slate-400 uppercase tracking-wider block">Yopilganlar</span>
-                <span id="total-settled" class="text-sm font-extrabold text-emerald-600 block mt-0.5">0 ta</span>
-            </div>
-        </div>
-
-        <div class="space-y-2">
-            <div class="relative">
-                <input type="text" id="search-input" oninput="handleSearch()" placeholder="Ism yoki telefon raqami orqali qidirish..." 
-                       class="w-full bg-white border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl pl-3 pr-10 py-2.5 text-xs outline-none transition-all placeholder:text-slate-400 shadow-sm">
-                <span class="absolute right-3.5 top-3 text-slate-400 pointer-events-none">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                </span>
-            </div>
-            
-            <div class="flex gap-1 overflow-x-auto no-scrollbar py-0.5">
-                <button onclick="filterDebts('all')" id="filter-all" class="px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 text-white shadow-sm transition-all whitespace-nowrap">Barchasi</button>
-                <button onclick="filterDebts('active')" id="filter-active" class="px-3 py-1.5 rounded-lg text-[11px] font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap">Qarzdorlar</button>
-                <button onclick="filterDebts('settled')" id="filter-settled" class="px-3 py-1.5 rounded-lg text-[11px] font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap">To'langanlar</button>
-            </div>
-        </div>
-
-        <div class="space-y-2">
-            <h3 class="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-1">Ro'yxat yozuvlari</h3>
-            
-            <div id="loading-spinner" class="text-center py-10 text-slate-400 text-xs font-medium">
-                Ma'lumotlar yuklanmoqda...
-            </div>
-
-            <div id="records-container" class="space-y-2 hidden">
-                </div>
-        </div>
-    </div>
-
-    <div id="profile-drawer" class="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-end justify-center hidden opacity-0 transition-opacity duration-200">
-        <div class="bg-white w-full max-w-md rounded-t-3xl p-5 space-y-4 shadow-2xl transform translate-y-full transition-transform duration-200 max-h-[92vh] overflow-y-auto no-scrollbar">
-            <div class="flex justify-between items-center border-b border-slate-100 pb-3">
-                <div>
-                    <h3 class="font-bold text-slate-900 text-base" id="drawer-customer-name">Mijoz Profili</h3>
-                    <p class="text-[11px] text-slate-400 font-medium" id="drawer-customer-phone">📞 -</p>
-                </div>
-                <button onclick="closeModal('profile-drawer')" class="text-slate-400 hover:text-slate-600 text-xl font-bold px-2">&times;</button>
-            </div>
-
-            <div class="bg-slate-50 border border-slate-100 rounded-2xl p-4 flex justify-between items-center">
-                <div>
-                    <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Qolgan Balans</span>
-                    <span id="drawer-balance" class="text-lg font-black text-rose-600 block mt-0.5">0 UZS</span>
-                </div>
-                <div class="text-right">
-                    <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Boshlang'ich qarz</span>
-                    <span id="drawer-initial" class="text-xs font-semibold text-slate-500 block mt-0.5">0 UZS</span>
-                </div>
-            </div>
-
-            <div class="space-y-2">
-                <h4 class="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-0.5">To'lovlar Tarixi Logi</h4>
-                <div id="drawer-history-container" class="space-y-1.5 max-h-40 overflow-y-auto no-scrollbar">
-                    </div>
-            </div>
-
-            <div id="payment-actions-section" class="border-t border-slate-100 pt-3 space-y-2.5">
-                <h4 class="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-0.5">To'lov qabul qilish (Qisman/To'liq)</h4>
-                <form id="payment-form" onsubmit="submitPayment(event)" class="grid grid-cols-3 gap-2">
-                    <input type="hidden" id="payment-debt-id">
-                    <div class="col-span-2">
-                        <input type="number" id="payment-amount" required min="1" placeholder="Summa kiritish (UZS)" 
-                               class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
-                    </div>
-                    <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl text-xs transition-all active:scale-95">
-                        Kiritish
-                    </button>
-                    <div class="col-span-3">
-                        <input type="text" id="payment-notes" placeholder="To'lov izohi (Masalan: naqd, karta orqali...)" 
-                               class="w-full border border-slate-200 rounded-xl px-3 py-1.5 text-[11px] outline-none focus:border-indigo-500">
-                    </div>
-                </form>
-            </div>
-
-            <div class="border-t border-slate-100 pt-3 flex gap-2">
-                <button type="button" onclick="submitDeleteDebt()" class="w-full bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold py-2 rounded-xl text-xs transition-all border border-rose-100 flex items-center justify-center gap-1">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-14v4M1 7h22"></path></svg>
-                    Yozuvni butunlay o'chirish
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <div id="add-debt-modal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-end justify-center hidden opacity-0 transition-opacity duration-200">
-        <div class="bg-white w-full max-w-md rounded-t-3xl p-5 space-y-4 shadow-2xl transform translate-y-full transition-transform duration-200">
-            <div class="flex justify-between items-center border-b border-slate-100 pb-3">
-                <h3 class="font-bold text-slate-900 text-base">Yangi qarz hisobini ochish</h3>
-                <button onclick="closeModal('add-debt-modal')" class="text-slate-400 hover:text-slate-600 text-xl font-bold px-2">&times;</button>
-            </div>
-            <form id="add-debt-form" onsubmit="submitAddDebt(event)" class="space-y-3">
-                <div>
-                    <label class="block text-[11px] font-semibold text-slate-500 mb-1">Mijoz ism-sharifi *</label>
-                    <input type="text" id="form-name" required class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
-                </div>
-                <div>
-                    <label class="block text-[11px] font-semibold text-slate-500 mb-1">Telefon raqami</label>
-                    <input type="text" id="form-phone" placeholder="Masalan: +998901234567" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
-                </div>
-                <div>
-                    <label class="block text-[11px] font-semibold text-slate-500 mb-1">Qarz miqdori (UZS) *</label>
-                    <input type="number" id="form-amount" required min="1" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
-                </div>
-                <div>
-                    <label class="block text-[11px] font-semibold text-slate-500 mb-1">Maxsus eslatma / Mahsulotlar</label>
-                    <input type="text" id="form-notes" placeholder="Masalan: Un, yog' olindi" class="w-full border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-indigo-500">
-                </div>
-                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2.5 rounded-xl text-xs transition-all mt-1 shadow-sm">
-                    Tizimga saqlash
-                </button>
-            </form>
-        </div>
-    </div>
-
-    <script>
-        const tg = window.Telegram.WebApp;
-        tg.ready();
-        tg.expand();
-
-        let rawDebtsData = [];
-        let activeFilter = 'all';
-        let currentUserId = 0;
-
-        const user = tg.initDataUnsafe?.user;
-        if (user) {
-            currentUserId = user.id;
-            document.getElementById('user-greeting').innerText = `${user.first_name} | Qarz Kontrol`;
-        }
-        document.getElementById('current-date').innerText = new Date().toLocaleDateString('uz-UZ', { weekday: 'long', month: 'short', day: 'numeric' });
-
-        function openModal(id) {
-            const modal = document.getElementById(id);
-            modal.classList.remove('hidden');
-            setTimeout(() => {
-                modal.classList.remove('opacity-0');
-                modal.querySelector('div').classList.remove('translate-y-full');
-            }, 10);
-        }
-
-        function closeModal(id) {
-            const modal = document.getElementById(id);
-            modal.classList.add('opacity-0');
-            modal.querySelector('div').classList.add('translate-y-full');
-            setTimeout(() => modal.classList.add('hidden'), 200);
-        }
-
-        async function openProfileDrawer(id, name, phone, remaining, amount_owed, notes) {
-            document.getElementById('payment-debt-id').value = id;
-            document.getElementById('drawer-customer-name').innerText = name;
-            document.getElementById('drawer-customer-phone').innerText = phone ? `📞 ${phone}` : '📞 Telefon raqami yo\'q';
-            document.getElementById('drawer-balance').innerText = new Intl.NumberFormat('uz-UZ').format(remaining) + ' UZS';
-            document.getElementById('drawer-initial').innerText = new Intl.NumberFormat('uz-UZ').format(amount_owed) + ' UZS';
-            document.getElementById('payment-amount').max = remaining;
-            document.getElementById('payment-form').reset();
-
-            if (remaining <= 0) {
-                document.getElementById('payment-actions-section').classList.add('hidden');
-                document.getElementById('drawer-balance').className = "text-lg font-black text-emerald-600 block mt-0.5";
-            } else {
-                document.getElementById('payment-actions-section').classList.remove('hidden');
-                document.getElementById('drawer-balance').className = "text-lg font-black text-rose-600 block mt-0.5";
-            }
-
-            const historyContainer = document.getElementById('drawer-history-container');
-            historyContainer.innerHTML = '<div class="text-[11px] text-slate-400">Yuklanmoqda...</div>';
-
-            openModal('profile-drawer');
-
-            try {
-                const res = await fetch(`/api/debt_history/${id}`);
-                const history = await res.json();
-                historyContainer.innerHTML = '';
-
-                if (history.length === 0) {
-                    historyContainer.innerHTML = '<div class="text-[11px] text-slate-400 py-1 px-0.5">Ushbu mijoz bo\'yicha to\'lovlar mavjud emas.</div>';
-                } else {
-                    history.forEach(log => {
-                        const dateObj = new Date(log.payment_date).toLocaleDateString('uz-UZ', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-                        const logRow = document.createElement('div');
-                        logRow.className = "flex justify-between items-center bg-slate-50 border border-slate-100 rounded-xl p-2 text-[11px]";
-                        logRow.innerHTML = `
-                            <div>
-                                <span class="font-bold text-emerald-600">+ ${new Intl.NumberFormat('uz-UZ').format(log.amount_paid)} UZS</span>
-                                <p class="text-[10px] text-slate-400 mt-0.5">${log.notes ? log.notes : 'To\'lov qabul qilindi'}</p>
-                            </div>
-                            <span class="text-[10px] text-slate-400 text-right font-medium">${dateObj}</span>
-                        `;
-                        historyContainer.appendChild(logRow);
-                    });
-                }
-            } catch (err) {
-                historyContainer.innerHTML = '<div class="text-[11px] text-rose-500">Tarixni yuklashda xatolik.</div>';
-            }
-        }
-
-        async function loadDataStream() {
-            try {
-                const response = await fetch('/api/dashboard');
-                const data = await response.json();
-                
-                rawDebtsData = data.debts;
-                
-                document.getElementById('total-amount').innerText = new Intl.NumberFormat('uz-UZ').format(data.total_outstanding) + ' UZS';
-                document.getElementById('total-debtors').innerText = data.debts.filter(d => d.remaining_balance > 0).length + ' ta';
-                document.getElementById('total-settled').innerText = data.debts.filter(d => d.remaining_balance <= 0).length + ' ta';
-                
-                applyFiltersAndSearch(document.getElementById('search-input').value.toLowerCase(), activeFilter);
-                
-                document.getElementById('loading-spinner').classList.add('hidden');
-                document.getElementById('records-container').classList.remove('hidden');
-            } catch (err) {
-                console.error("Dashboard load error:", err);
-                document.getElementById('loading-spinner').innerText = "Ma'lumot uzatish tarmog'ida uzilish yuz berdi. Sahifani yangilang.";
-            }
-        }
-
-        function renderRecordsList(items) {
-            const container = document.getElementById('records-container');
-            container.innerHTML = '';
-            
-            if (items.length === 0) {
-                container.innerHTML = '<div class="text-center py-12 text-slate-400 text-xs font-medium">Qidiruv bo\'yicha yozuvlar topilmadi</div>';
-                return;
-            }
-
-            items.forEach(item => {
-                const isSettled = item.remaining_balance <= 0;
-                const element = document.createElement('div');
-                element.className = `bg-white border ${isSettled ? 'border-slate-100 opacity-60' : 'border-slate-200/50'} p-3.5 rounded-xl shadow-xs flex justify-between items-center transition-all active:scale-[0.99] cursor-pointer hover:border-indigo-100`;
-                element.setAttribute('onclick', `openProfileDrawer(${item.id}, "${(item.customer_name||'').replace(/"/g,'&quot;')}", "${(item.phone||'').replace(/"/g,'&quot;')}", ${item.remaining_balance}, ${item.amount_owed}, "${(item.notes||'').replace(/"/g,'&quot;')}")`);
-                
-                element.innerHTML = `
-                    <div class="space-y-0.5 max-w-[65%]">
-                        <h4 class="font-bold text-slate-800 text-xs tracking-tight truncate">${item.customer_name}</h4>
-                        <p class="text-[10px] text-slate-400 font-medium">${item.phone ? '📞 ' + item.phone : '📞 Raqam kiritilmagan'}</p>
-                        ${item.notes ? `<p class="text-[10px] text-slate-500 bg-slate-50 inline-block px-2 py-0.5 rounded-md border border-slate-100/70 mt-1 truncate max-w-full">${item.notes}</p>` : ''}
-                    </div>
-                    <div class="text-right">
-                        <span class="text-xs font-black ${isSettled ? 'text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md' : 'text-rose-600'}">
-                            ${isSettled ? "Yopilgan" : new Intl.NumberFormat('uz-UZ').format(item.remaining_balance) + ' UZS'}
-                        </span>
-                        <p class="text-[9px] text-slate-400 font-bold mt-1 uppercase tracking-wider">Xodim: ${item.seller_name}</p>
-                    </div>
-                `;
-                container.appendChild(element);
-            });
-        }
-
-        function handleSearch() {
-            const query = document.getElementById('search-input').value.toLowerCase();
-            applyFiltersAndSearch(query, activeFilter);
-        }
-
-        function filterDebts(type) {
-            activeFilter = type;
-            ['all', 'active', 'settled'].forEach(t => {
-                const btn = document.getElementById(`filter-${t}`);
-                if (t === type) {
-                    btn.className = "px-3 py-1.5 rounded-lg text-[11px] font-semibold bg-slate-900 text-white shadow-sm transition-all whitespace-nowrap";
-                } else {
-                    btn.className = "px-3 py-1.5 rounded-lg text-[11px] font-medium bg-white border border-slate-200 text-slate-600 hover:bg-slate-50 transition-all whitespace-nowrap";
-                }
-            });
-            const query = document.getElementById('search-input').value.toLowerCase();
-            applyFiltersAndSearch(query, type);
-        }
-
-        function applyFiltersAndSearch(query, filter) {
-            let filtered = rawDebtsData;
-            if (filter === 'active') filtered = filtered.filter(d => d.remaining_balance > 0);
-            else if (filter === 'settled') filtered = filtered.filter(d => d.remaining_balance <= 0);
-            if (query) {
-                filtered = filtered.filter(d => 
-                    d.customer_name.toLowerCase().includes(query) || 
-                    (d.phone && d.phone.includes(query))
-                );
-            }
-            renderRecordsList(filtered);
-        }
-
-        async function submitAddDebt(e) {
-            e.preventDefault();
-            const btn = e.target.querySelector('button[type=submit]');
-            btn.disabled = true;
-            btn.innerText = 'Saqlanmoqda...';
-            const payload = {
-                customer_name: document.getElementById('form-name').value,
-                phone: document.getElementById('form-phone').value,
-                amount: parseFloat(document.getElementById('form-amount').value),
-                notes: document.getElementById('form-notes').value,
-                seller_id: currentUserId || 0
-            };
-            try {
-                const res = await fetch('/api/add_debt', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const result = await res.json();
-                if (res.ok) {
-                    closeModal('add-debt-modal');
-                    document.getElementById('add-debt-form').reset();
-                    loadDataStream();
-                    if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
-                } else {
-                    alert(result.error || "Xatolik yuz berdi");
-                }
-            } catch (err) {
-                alert("Yozuvni kiritishda tarmoq xatoligi: " + err.message);
-            } finally {
-                btn.disabled = false;
-                btn.innerText = 'Tizimga saqlash';
-            }
-        }
-
-        async function submitPayment(e) {
-            e.preventDefault();
-            const payload = {
-                debt_id: parseInt(document.getElementById('payment-debt-id').value),
-                amount: parseFloat(document.getElementById('payment-amount').value),
-                notes: document.getElementById('payment-notes').value
-            };
-            try {
-                const res = await fetch('/api/pay_debt', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                if (res.ok) {
-                    closeModal('profile-drawer');
-                    loadDataStream();
-                    if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
-                } else {
-                    const errData = await res.json();
-                    alert(errData.error || "Xatolik");
-                }
-            } catch (err) {
-                alert("To'lov jarayonida tarmoq xatoligi");
-            }
-        }
-
-        async function submitDeleteDebt() {
-            const debtId = document.getElementById('payment-debt-id').value;
-            if (!confirm("Ushbu hisob qaydnomasini va unga tegishli barcha to'lovlar tarixini butunlay o'chirmoqchimisiz?")) return;
-            try {
-                const res = await fetch(`/api/delete_debt/${debtId}`, { method: 'DELETE' });
-                if (res.ok) {
-                    closeModal('profile-drawer');
-                    loadDataStream();
-                    if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('warning');
-                }
-            } catch (err) {
-                alert("O'chirishda texnik nosozlik");
-            }
-        }
-
-        loadDataStream();
-    </script>
-</body>
-</html>
-"""
+@flask_app.route('/')
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "alive", "message": "Bot is running!"}), 200
 
 # ---------- Configuration ----------
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -440,18 +33,37 @@ if not BOT_TOKEN:
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is required! Set your Neon PostgreSQL connection string.")
+    raise ValueError("DATABASE_URL environment variable is required!")
 
-# ---------- PostgreSQL Connection ----------
+# ---------- Helper Functions ----------
+def normalize_text(text: str) -> str:
+    """Normalize text for case-insensitive search."""
+    if not text:
+        return ""
+    cyrillic_to_latin = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+        'ў': 'o\'', 'қ': 'q', 'ғ': 'g\'', 'ҳ': 'h', 'нг': 'ng'
+    }
+    normalized = text.lower()
+    for cyr, lat in cyrillic_to_latin.items():
+        normalized = normalized.replace(cyr, lat)
+    normalized = unicodedata.normalize('NFKD', normalized).encode('ASCII', 'ignore').decode('ASCII')
+    normalized = re.sub(r'[^a-z0-9]', '', normalized)
+    return normalized
+
+# ---------- Database Setup ----------
 def get_db():
-    """Return a new psycopg2 connection to Neon PostgreSQL."""
-    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-    return conn
+    return psycopg2.connect(DATABASE_URL)
 
-# ---------- Database Initialisation ----------
 def init_db():
+    """Set up the cloud PostgreSQL database schemas."""
     conn = get_db()
     cursor = conn.cursor()
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             telegram_id BIGINT PRIMARY KEY,
@@ -472,7 +84,8 @@ def init_db():
             notes TEXT,
             seller_telegram_id BIGINT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (seller_telegram_id) REFERENCES users(telegram_id)
         )
     ''')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_debt_name_normalized ON debts(customer_name_normalized)')
@@ -480,42 +93,24 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS payments (
             id SERIAL PRIMARY KEY,
-            debt_id INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
+            debt_id INTEGER NOT NULL,
             amount_paid REAL NOT NULL,
             payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            notes TEXT
+            notes TEXT,
+            FOREIGN KEY (debt_id) REFERENCES debts(id) ON DELETE CASCADE
         )
     ''')
     cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
     conn.commit()
-    cursor.close()
     conn.close()
-    logging.info("Database initialised successfully.")
 
-# ---------- Text Normalisation ----------
-def normalize_text(text: str) -> str:
-    if not text: return ""
-    cyrillic_to_latin = {
-        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
-        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
-        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-        'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
-        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
-        'ў': "o'", 'қ': 'q', 'ғ': "g'", 'ҳ': 'h', 'нг': 'ng'
-    }
-    normalized = text.lower()
-    for cyr, lat in cyrillic_to_latin.items():
-        normalized = normalized.replace(cyr, lat)
-    normalized = unicodedata.normalize('NFKD', normalized).encode('ASCII', 'ignore').decode('ASCII')
-    return re.sub(r'[^a-z0-9]', '', normalized)
-
-# ---------- DB Helper Functions ----------
+# ---------- Database Functions ----------
 def get_user(telegram_id: int) -> Optional[Dict]:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT telegram_id, username, first_name, role FROM users WHERE telegram_id = %s", (telegram_id,))
     row = cursor.fetchone()
-    cursor.close(); conn.close()
+    conn.close()
     if row:
         return {"telegram_id": row[0], "username": row[1], "first_name": row[2], "role": row[3]}
     return None
@@ -524,34 +119,38 @@ def create_user(telegram_id: int, username: str, first_name: str, role: str) -> 
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO users (telegram_id, username, first_name, role) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
-            (telegram_id, username, first_name, role)
-        )
+        cursor.execute("INSERT INTO users (telegram_id, username, first_name, role) VALUES (%s, %s, %s, %s)",
+                       (telegram_id, username, first_name, role))
         conn.commit()
-        cursor.close()
         return True
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"create_user error: {e}")
+    except psycopg2.IntegrityError:
         return False
     finally:
         conn.close()
 
+def delete_user(telegram_id: int) -> bool:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM users WHERE telegram_id = %s", (telegram_id,))
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
+
 def get_all_users() -> List[Dict]:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id, username, first_name, role FROM users")
+    cursor.execute("SELECT telegram_id, username, first_name, role, created_at FROM users ORDER BY created_at")
     rows = cursor.fetchall()
-    cursor.close(); conn.close()
-    return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3]} for r in rows]
+    conn.close()
+    return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3], "created_at": r[4]} for r in rows]
 
 def get_admins_and_sellers() -> List[Dict]:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT telegram_id, username, first_name, role FROM users WHERE role IN ('admin','seller')")
     rows = cursor.fetchall()
-    cursor.close(); conn.close()
+    conn.close()
     return [{"telegram_id": r[0], "username": r[1], "first_name": r[2], "role": r[3]} for r in rows]
 
 def add_debt(customer_name: str, phone: str, amount: float, notes: str, seller_telegram_id: int) -> int:
@@ -565,18 +164,36 @@ def add_debt(customer_name: str, phone: str, amount: float, notes: str, seller_t
     )
     debt_id = cursor.fetchone()[0]
     conn.commit()
-    cursor.close(); conn.close()
+    conn.close()
     return debt_id
 
 def get_debt(debt_id: int) -> Optional[Dict]:
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, customer_name, phone, amount_owed, remaining_balance, notes, seller_telegram_id FROM debts WHERE id = %s", (debt_id,))
+    cursor.execute("SELECT id, customer_name, phone, amount_owed, remaining_balance, notes, seller_telegram_id, created_at, updated_at FROM debts WHERE id = %s", (debt_id,))
     row = cursor.fetchone()
-    cursor.close(); conn.close()
+    conn.close()
     if row:
-        return {"id": row[0], "customer_name": row[1], "phone": row[2], "amount_owed": row[3], "remaining_balance": row[4], "notes": row[5], "seller_telegram_id": row[6]}
+        return {"id": row[0], "customer_name": row[1], "phone": row[2], "amount_owed": row[3], "remaining_balance": row[4], "notes": row[5], "seller_telegram_id": row[6], "created_at": row[7], "updated_at": row[8]}
     return None
+
+def update_debt(debt_id: int, **kwargs) -> bool:
+    allowed_fields = {"customer_name", "phone", "amount_owed", "remaining_balance", "notes"}
+    updates = {k: v for k, v in kwargs.items() if k in allowed_fields}
+    if not updates:
+        return False
+    if "customer_name" in updates:
+        updates["customer_name_normalized"] = normalize_text(updates["customer_name"])
+    updates["updated_at"] = datetime.now().isoformat()
+    set_clause = ", ".join([f"{key} = %s" for key in updates.keys()])
+    values = list(updates.values()) + [debt_id]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE debts SET {set_clause} WHERE id = %s", values)
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
 
 def delete_debt(debt_id: int) -> bool:
     conn = get_db()
@@ -584,310 +201,599 @@ def delete_debt(debt_id: int) -> bool:
     cursor.execute("DELETE FROM debts WHERE id = %s", (debt_id,))
     conn.commit()
     affected = cursor.rowcount
-    cursor.close(); conn.close()
+    conn.close()
     return affected > 0
 
 def add_payment(debt_id: int, amount: float, notes: str = "") -> bool:
     debt = get_debt(debt_id)
     if not debt or amount <= 0 or amount > debt["remaining_balance"]:
         return False
-    new_balance = round(debt["remaining_balance"] - amount, 2)
+    new_balance = debt["remaining_balance"] - amount
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("INSERT INTO payments (debt_id, amount_paid, notes) VALUES (%s, %s, %s)", (debt_id, amount, notes))
-    cursor.execute("UPDATE debts SET remaining_balance = %s, updated_at = %s WHERE id = %s", (new_balance, datetime.now(), debt_id))
+    cursor.execute("UPDATE debts SET remaining_balance = %s, updated_at = %s WHERE id = %s", (new_balance, datetime.now().isoformat(), debt_id))
     conn.commit()
-    cursor.close(); conn.close()
+    conn.close()
     return True
 
-def get_all_debts() -> List[Dict]:
+def search_debts(query: str) -> List[Dict]:
+    norm_query = normalize_text(query)
     conn = get_db()
     cursor = conn.cursor()
-    # LEFT JOIN so debts always show even if seller user record is missing
     cursor.execute("""
         SELECT d.id, d.customer_name, d.phone, d.amount_owed, d.remaining_balance, d.notes,
-               d.seller_telegram_id, d.created_at, u.username, u.first_name
+               d.seller_telegram_id, d.created_at, d.updated_at, u.username, u.first_name
         FROM debts d
-        LEFT JOIN users u ON d.seller_telegram_id = u.telegram_id
-        ORDER BY d.remaining_balance DESC, d.created_at DESC
-    """)
+        JOIN users u ON d.seller_telegram_id = u.telegram_id
+        WHERE d.phone LIKE %s OR d.customer_name_normalized LIKE %s
+        ORDER BY d.created_at DESC
+    """, (f"%{query}%", f"%{norm_query}%"))
     rows = cursor.fetchall()
-    cursor.close(); conn.close()
-    return [{
-        "id": r[0], "customer_name": r[1], "phone": r[2] or "",
-        "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5] or "",
-        "seller_telegram_id": r[6],
-        "created_at": str(r[7]),
-        "seller_name": r[8] or r[9] or str(r[6])
-    } for r in rows]
+    conn.close()
+    return [{"id": r[0], "customer_name": r[1], "phone": r[2], "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5], "seller_telegram_id": r[6], "created_at": r[7], "updated_at": r[8], "seller_name": r[9] or r[10] or str(r[6])} for r in rows]
+
+def get_all_debts(filters: Dict = None) -> List[Dict]:
+    query = """
+        SELECT d.id, d.customer_name, d.phone, d.amount_owed, d.remaining_balance, d.notes,
+               d.seller_telegram_id, d.created_at, d.updated_at, u.username, u.first_name
+        FROM debts d
+        JOIN users u ON d.seller_telegram_id = u.telegram_id
+    """
+    conditions = []
+    params = []
+    if filters:
+        if filters.get("seller_id"):
+            conditions.append("d.seller_telegram_id = %s")
+            params.append(filters["seller_id"])
+        if filters.get("customer_name"):
+            norm_name = normalize_text(filters["customer_name"])
+            conditions.append("d.customer_name_normalized LIKE %s")
+            params.append(f"%{norm_name}%")
+        if filters.get("phone"):
+            conditions.append("d.phone LIKE %s")
+            params.append(f"%{filters['phone']}%")
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY d.created_at DESC"
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"id": r[0], "customer_name": r[1], "phone": r[2], "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5], "seller_telegram_id": r[6], "created_at": r[7], "updated_at": r[8], "seller_name": r[9] or r[10] or str(r[6])} for r in rows]
 
 def get_total_outstanding() -> float:
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT COALESCE(SUM(remaining_balance), 0) FROM debts")
     total = cursor.fetchone()[0]
-    cursor.close(); conn.close()
-    return float(total)
+    conn.close()
+    return total
 
-# ---------- Flask Routes ----------
-@flask_app.route('/')
-@flask_app.route('/health')
-def health():
-    return jsonify({"status": "alive", "message": "Server online!"}), 200
+def get_outstanding_by_seller() -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT u.telegram_id, u.username, u.first_name, COALESCE(SUM(d.remaining_balance), 0)
+        FROM users u
+        LEFT JOIN debts d ON u.telegram_id = d.seller_telegram_id
+        WHERE u.role IN ('admin','seller')
+        GROUP BY u.telegram_id, u.username, u.first_name
+        ORDER BY SUM(d.remaining_balance) DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"seller_id": r[0], "name": r[1] or r[2] or str(r[0]), "total": r[3]} for r in rows]
 
-@flask_app.route('/webapp')
-def webapp_interface():
-    return render_template_string(MINI_APP_HTML)
+def get_largest_debtors(limit: int = 5) -> List[Dict]:
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT customer_name, phone, SUM(remaining_balance) as total_balance
+        FROM debts
+        GROUP BY customer_name, phone
+        ORDER BY total_balance DESC
+        LIMIT %s
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"name": r[0], "phone": r[1], "total": r[2]} for r in rows]
 
-@flask_app.route('/api/dashboard')
-def api_dashboard_metrics():
-    try:
-        total = get_total_outstanding()
-        debts = get_all_debts()
-        return jsonify({"total_outstanding": total, "debts": debts})
-    except Exception as e:
-        logging.error(f"Dashboard error: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+# ---------- Telegram Handlers ----------
+NAME, PHONE, AMOUNT, NOTES, DEBT_ID, PAY_AMOUNT, EDIT_FIELD, EDIT_VALUE, SEARCH_QUERY, USER_ID, USER_ROLE = range(11)
 
-@flask_app.route('/api/debt_history/<int:debt_id>')
-def api_debt_history(debt_id):
-    try:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT amount_paid, payment_date, notes FROM payments WHERE debt_id = %s ORDER BY payment_date DESC", (debt_id,))
-        rows = cursor.fetchall()
-        cursor.close(); conn.close()
-        logs = [{"amount_paid": r[0], "payment_date": str(r[1]), "notes": r[2]} for r in rows]
-        return jsonify(logs), 200
-    except Exception as e:
-        logging.error(f"Debt history error: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
-@flask_app.route('/api/add_debt', methods=['POST'])
-def api_add_debt():
-    data = request.json or {}
-    try:
-        seller_id = int(data.get('seller_id') or 0)
-        # Ensure a valid user exists for this seller_id
-        if seller_id and not get_user(seller_id):
-            create_user(seller_id, "webapp_user", "Mini App Xodimi", "admin")
-        elif not seller_id:
-            # Opened outside Telegram — use or create a default admin
-            seller_id = 1
-            if not get_user(seller_id):
-                create_user(seller_id, "default_admin", "Administrator", "admin")
-
-        name = data.get('customer_name', '').strip()
-        amount = float(data.get('amount', 0))
-        if not name or amount <= 0:
-            return jsonify({"error": "Ism va summa majburiy maydonlar!"}), 400
-
-        debt_id = add_debt(
-            customer_name=name,
-            phone=data.get('phone', '').strip(),
-            amount=amount,
-            notes=data.get('notes', '').strip(),
-            seller_telegram_id=seller_id
-        )
-        return jsonify({"success": True, "debt_id": debt_id}), 200
-    except Exception as e:
-        logging.error(f"add_debt error: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 400
-
-@flask_app.route('/api/pay_debt', methods=['POST'])
-def api_pay_debt():
-    data = request.json or {}
-    try:
-        success = add_payment(
-            debt_id=int(data.get('debt_id', 0)),
-            amount=float(data.get('amount', 0)),
-            notes=data.get('notes', '').strip()
-        )
-        if success:
-            return jsonify({"success": True}), 200
-        return jsonify({"error": "Noto'g'ri to'lov summasi kiritildi."}), 400
-    except Exception as e:
-        logging.error(f"pay_debt error: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
-@flask_app.route('/api/delete_debt/<int:debt_id>', methods=['DELETE'])
-def api_delete_debt(debt_id):
-    try:
-        if delete_debt(debt_id):
-            return jsonify({"success": True}), 200
-        return jsonify({"error": "Yozuv topilmadi"}), 404
-    except Exception as e:
-        logging.error(f"delete_debt error: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
-@flask_app.route('/api/export_csv')
-def api_export_csv():
-    try:
-        debts = get_all_debts()
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', "Boshlang'ich Qarz", 'Qolgan Balans', 'Eslatma/Izoh', "Mas'ul Xodim", 'Sana'])
-        for d in debts:
-            writer.writerow([d['id'], d['customer_name'], d['phone'], d['amount_owed'], d['remaining_balance'], d['notes'], d['seller_name'], d['created_at']])
-        return Response(
-            output.getvalue(),
-            mimetype="text/csv",
-            headers={"Content-disposition": f"attachment; filename=Qarz_Hisobot_{datetime.now().strftime('%Y%m%d')}.csv"}
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@flask_app.route('/api/trigger_backup', methods=['GET', 'POST'])
-def api_trigger_backup():
-    group_id = os.environ.get('BACKUP_GROUP_ID')
-    if not group_id:
-        return jsonify({"error": "BACKUP_GROUP_ID muhit o'zgaruvchisi o'rnatilmagan."}), 400
-    try:
-        debts = get_all_debts()
-        total_outstanding = get_total_outstanding()
-        active_count = len([d for d in debts if d['remaining_balance'] > 0])
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['ID', 'Mijoz Ismi', 'Telefon Raqami', "Boshlang'ich Qarz", 'Qolgan Balans', 'Eslatma/Izoh', "Mas'ul Xodim", 'Sana'])
-        for d in debts:
-            writer.writerow([d['id'], d['customer_name'], d['phone'], d['amount_owed'], d['remaining_balance'], d['notes'], d['seller_name'], d['created_at']])
-        csv_bytes = output.getvalue().encode('utf-8')
-        file_stream = io.BytesIO(csv_bytes)
-        file_stream.name = f"Qarz_Backup_{datetime.now().strftime('%Y_%m_%d')}.csv"
-
-        async def send_file_to_group():
-            bot = Bot(token=BOT_TOKEN)
-            async with bot:
-                await bot.send_document(
-                    chat_id=int(group_id),
-                    document=file_stream,
-                    caption=(
-                        f"📁 *KUNLIK AVTOMATIK BACKUP*\n"
-                        f"📆 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-                        f"• Jami qarz: {total_outstanding:,.0f} UZS\n"
-                        f"• Faol qarzdorlar: {active_count} ta"
-                    ),
-                    parse_mode="Markdown"
-                )
-        asyncio.run(send_file_to_group())
-        return jsonify({"success": True}), 200
-    except Exception as e:
-        logging.error(f"backup error: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
-# ---------- Telegram Bot ----------
 def get_main_keyboard(role: str):
-    app_host = os.environ.get('RENDER_EXTERNAL_HOSTNAME', 'localhost:5000')
-    webapp_url = f"https://{app_host}/webapp"
-    keyboard = [[InlineKeyboardButton("📱 Ilovani ochish (Mini App)", web_app=WebAppInfo(url=webapp_url))]]
     if role == "admin":
-        keyboard.append([InlineKeyboardButton("👥 Xodimlarni boshqarish", callback_data="menu_users")])
+        keyboard = [
+            [InlineKeyboardButton("➕ Қарз қўшиш", callback_data="menu_adddebt")],
+            [InlineKeyboardButton("💰 Тўлов қабул қилиш", callback_data="menu_pay")],
+            [InlineKeyboardButton("✏️ Қарзни таҳрирлаш", callback_data="menu_editdebt")],
+            [InlineKeyboardButton("🗑️ Қарзни ўчириш", callback_data="menu_deletedebt")],
+            [InlineKeyboardButton("🔍 Қарзларни излаш", callback_data="menu_search")],
+            [InlineKeyboardButton("📋 Барча қарзлар", callback_data="menu_listdebts")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
+            [InlineKeyboardButton("📁 CSV экспорт", callback_data="menu_export")],
+            [InlineKeyboardButton("👥 Фойдаланувчилар", callback_data="menu_users")],
+            [InlineKeyboardButton("❌ Бекор қилиш", callback_data="menu_cancel")]
+        ]
+    elif role == "seller":
+        keyboard = [
+            [InlineKeyboardButton("➕ Қарз қўшиш", callback_data="menu_adddebt")],
+            [InlineKeyboardButton("💰 Тўлов қабул қилиш", callback_data="menu_pay")],
+            [InlineKeyboardButton("✏️ Қарзни таҳрирлаш", callback_data="menu_editdebt")],
+            [InlineKeyboardButton("🗑️ Қарзни ўчириш", callback_data="menu_deletedebt")],
+            [InlineKeyboardButton("🔍 Қарзларни излаш", callback_data="menu_search")],
+            [InlineKeyboardButton("📋 Барча қарзлар", callback_data="menu_listdebts")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
+            [InlineKeyboardButton("📁 CSV экспорт", callback_data="menu_export")],
+            [InlineKeyboardButton("❌ Бекор қилиш", callback_data="menu_cancel")]
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("🔍 Қарзларни излаш", callback_data="menu_search")],
+            [InlineKeyboardButton("📋 Барча қарзлар", callback_data="menu_listdebts")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
+            [InlineKeyboardButton("📁 CSV экспорт", callback_data="menu_export")],
+            [InlineKeyboardButton("❌ Бекор қилиш", callback_data="menu_cancel")]
+        ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_users_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Yangi xodim qo'shish", callback_data="menu_adduser")],
-        [InlineKeyboardButton("📋 Xodimlar ro'yxati", callback_data="menu_listusers")],
-        [InlineKeyboardButton("🔙 Bosh menyuga qaytish", callback_data="menu_back")]
-    ])
+    keyboard = [
+        [InlineKeyboardButton("➕ Фойдаланувчи қўшиш", callback_data="menu_adduser")],
+        [InlineKeyboardButton("❌ Фойдаланувчини ўчириш", callback_data="menu_removeuser")],
+        [InlineKeyboardButton("📋 Фойдаланувчилар рўйхати", callback_data="menu_listusers")],
+        [InlineKeyboardButton("🔙 Орқага", callback_data="menu_back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db_user = get_user(user.id)
+    telegram_id = user.id
+    username = user.username or ""
+    first_name = user.first_name or ""
+    db_user = get_user(telegram_id)
     if not db_user:
         admins = [u for u in get_admins_and_sellers() if u["role"] == "admin"]
         if not admins:
-            create_user(user.id, user.username or "", user.first_name or "", "admin")
-            db_user = get_user(user.id)
+            create_user(telegram_id, username, first_name, "admin")
+            db_user = get_user(telegram_id)
             await update.message.reply_text(
-                f"✅ Tizim faollashtirildi!\nSiz birinchi foydalanuvchi bo'lganingiz sababli *ADMIN* etib belgilandingiz.\n\n"
-                f"Mini App'ni ishga tushirish uchun pastdagi tugmani bosing:",
-                parse_mode="Markdown",
+                f"✅ Ассалому алайкум {first_name}! Сиз биринчи фойдаланувчисиз ва **АДМИН** этиб белгиландингиз.\n\n"
+                f"Қарзларни бошқариш учун тугмалардан фойдаланинг:",
                 reply_markup=get_main_keyboard("admin")
             )
         else:
-            await update.message.reply_text("❌ Kirish taqiqlangan. Administrator bilan bog'laning.")
+            await update.message.reply_text(
+                "❌ Кириш ҳуқуқи йўқ. Сиз рўйхатдан ўтмагансиз.\n"
+                "Супермаркет администраторига мурожаат қилинг."
+            )
         return
     await update.message.reply_text(
-        f"✅ Assalomu alaykum {user.first_name}!\nRolingiz: *{db_user['role'].upper()}*\n\nIlovani ochish uchun pastdagi tugmani bosing:",
-        parse_mode="Markdown",
+        f"✅ Ассалому алайкум {first_name}! Сизнинг ролингиз: **{db_user['role'].upper()}**\n\n"
+        f"Амални танланг:",
         reply_markup=get_main_keyboard(db_user['role'])
     )
-
-USER_ID, USER_ROLE = range(2)
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    db_user = get_user(query.from_user.id)
-    if not db_user or db_user['role'] != 'admin':
-        await query.edit_message_text("Sizda bu amalni bajarish uchun ruxsat yo'q.")
-        return ConversationHandler.END
-
-    if query.data == "menu_users":
-        await query.edit_message_text("👥 *Xodimlarni boshqarish paneli*", parse_mode="Markdown", reply_markup=get_users_menu())
-    elif query.data == "menu_listusers":
-        users = get_all_users()
-        msg = "📋 *Tizim xodimlari:*\n\n"
-        for u in users:
-            msg += f"• {u['first_name']} (@{u['username'] or '-'}) — *{u['role'].upper()}* (ID: `{u['telegram_id']}`)\n"
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_users_menu())
-    elif query.data == "menu_adduser":
+    user_id = query.from_user.id
+    db_user = get_user(user_id)
+    if not db_user:
+        await query.edit_message_text("Ҳуқуқингиз йўқ. Админга мурожаат қилинг.")
+        return
+    
+    action = query.data
+    role = db_user['role']
+    
+    if action == "menu_adddebt":
+        if role not in ("admin", "seller"):
+            await query.edit_message_text("⛔ Фақат сотувчилар ва adminлар қарз қўша олади.", reply_markup=get_main_keyboard(role))
+            return
+        context.user_data['action'] = 'adddebt'
+        await query.edit_message_text("➕ **Янги қарз қўшиш**\n\nМизожнинг **исмини** ёзинг:", parse_mode="Markdown")
+        return NAME
+    
+    elif action == "menu_pay":
+        if role not in ("admin", "seller"):
+            await query.edit_message_text("⛔ Ҳуқуқингиз йўқ.", reply_markup=get_main_keyboard(role))
+            return
+        context.user_data['action'] = 'pay'
+        await query.edit_message_text("💰 **Тўлов қабул қилиш**\n\nҚарзнинг **ID рақамини** ёзинг:", parse_mode="Markdown")
+        return DEBT_ID
+    
+    elif action == "menu_editdebt":
+        if role not in ("admin", "seller"):
+            await query.edit_message_text("⛔ Ҳуқуқингиз йўқ.", reply_markup=get_main_keyboard(role))
+            return
+        context.user_data['action'] = 'editdebt'
+        await query.edit_message_text("✏️ **Қарзни таҳрирлаш**\n\nҚарзнинг **ID рақамини** ёзинг:", parse_mode="Markdown")
+        return DEBT_ID
+    
+    elif action == "menu_deletedebt":
+        if role not in ("admin", "seller"):
+            await query.edit_message_text("⛔ Ҳуқуқингиз йўқ.", reply_markup=get_main_keyboard(role))
+            return
+        context.user_data['action'] = 'deletedebt'
+        await query.edit_message_text("🗑️ **Қарзни ўчириш**\n\nЎчириш учун қарзнинг **ID рақамини** ёзинг:", parse_mode="Markdown")
+        return DEBT_ID
+    
+    elif action == "menu_search":
+        context.user_data['action'] = 'search'
+        await query.edit_message_text("🔍 **Қарзларни излаш**\n\nМизож **исми** ёки **телефон рақамини** ёзинг:", parse_mode="Markdown")
+        return SEARCH_QUERY
+    
+    elif action == "menu_listdebts":
+        debts = get_all_debts()
+        if not debts:
+            await query.edit_message_text("📋 Қарзлар топилмади.", reply_markup=get_main_keyboard(role))
+        else:
+            msg = "📋 **Барча қарзлар:**\n\n"
+            for d in debts[:15]:
+                msg += f"ID: `{d['id']}` | {d['customer_name']} | Қолдиқ: {d['remaining_balance']:.2f} | Сотувчи: {d['seller_name']}\n"
+            if len(debts) > 15:
+                msg += f"\n... ва яна {len(debts)-15} та. Тўлиқ рўйхат учун экспорт қилинг."
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_main_keyboard(role))
+    
+    elif action == "menu_stats":
+        total_out = get_total_outstanding()
+        by_seller = get_outstanding_by_seller()
+        largest = get_largest_debtors(5)
+        msg = f"📊 **Статистика**\n\n💸 Жами қарз: **{total_out:.2f}**\n\n**Сотувчилар бўйича:**\n"
+        for s in by_seller:
+            msg += f"• {s['name']}: {s['total']:.2f}\n"
+        msg += "\n**Энг кўп қарздорлар (5 та):**\n"
+        for d in largest:
+            msg += f"• {d['name']} ({d['phone']}): {d['total']:.2f}\n"
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_main_keyboard(role))
+    
+    elif action == "menu_export":
+        debts = get_all_debts()
+        if not debts:
+            await query.edit_message_text("Экспорт қилиш учун маълумот йўқ.", reply_markup=get_main_keyboard(role))
+            return
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["ID","Мизож номи","Телефон","Қарз суммаси","Қолдиқ","Изоҳ","Сотувчи","Сана"])
+        for d in debts:
+            writer.writerow([d["id"], d["customer_name"], d["phone"], d["amount_owed"], d["remaining_balance"], d["notes"], d["seller_name"], d["created_at"]])
+        output.seek(0)
+        await query.edit_message_text("📁 CSV файл тайёрланмоқда...", reply_markup=get_main_keyboard(role))
+        await query.message.reply_document(document=io.BytesIO(output.getvalue().encode()), filename="qarzlar_eksport.csv", caption="Қарзлар экспорти")
+    
+    elif action == "menu_users":
+        if role != "admin":
+            await query.edit_message_text("⛔ Фақат админлар учун.", reply_markup=get_main_keyboard(role))
+            return
+        await query.edit_message_text("👥 **Фойдаланувчиларни бошқариш**", reply_markup=get_users_menu())
+    
+    elif action == "menu_adduser":
+        if role != "admin":
+            await query.edit_message_text("⛔ Фақат админлар учун.", reply_markup=get_main_keyboard(role))
+            return
         context.user_data['action'] = 'adduser'
-        await query.edit_message_text("➕ Yangi xodimning *Telegram ID* raqamini yuboring:", parse_mode="Markdown")
+        await query.edit_message_text("➕ **Фойдаланувчи қўшиш**\n\nҚўшиладиган фойдаланувчининг **Telegram ID** рақамини ёзинг.\n\n(ID ни @userinfobot дан олиш мумкин)", parse_mode="Markdown")
         return USER_ID
-    elif query.data == "menu_back":
-        await query.edit_message_text("Asosiy menyu:", reply_markup=get_main_keyboard(db_user['role']))
-    return ConversationHandler.END
+    
+    elif action == "menu_removeuser":
+        if role != "admin":
+            await query.edit_message_text("⛔ Фақат админлар учун.", reply_markup=get_main_keyboard(role))
+            return
+        context.user_data['action'] = 'removeuser'
+        await query.edit_message_text("❌ **Фойдаланувчини ўчириш**\n\nЎчириладиган фойдаланувчининг **Telegram ID** рақамини ёзинг.", parse_mode="Markdown")
+        return USER_ID
+    
+    elif action == "menu_listusers":
+        if role != "admin":
+            await query.edit_message_text("⛔ Фақат админлар учун.", reply_markup=get_main_keyboard(role))
+            return
+        users = get_all_users()
+        if not users:
+            await query.edit_message_text("Фойдаланувчилар топилмади.", reply_markup=get_users_menu())
+            return
+        msg = "📋 **Рўйхатдан ўтган фойдаланувчилар:**\n\n"
+        for u in users:
+            msg += f"• {u['first_name']} (@{u['username']}) - {u['role']} (ID: `{u['telegram_id']}`)\n"
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_users_menu())
+    
+    elif action == "menu_back":
+        await query.edit_message_text("Асосий меню", reply_markup=get_main_keyboard(role))
+    
+    elif action == "menu_cancel":
+        context.user_data.clear()
+        await query.edit_message_text("Амал бекор қилинди. Асосий меню:", reply_markup=get_main_keyboard(role))
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data.get('action')
-    if action == 'adduser':
+    if not action:
+        db_user = get_user(update.effective_user.id)
+        if db_user:
+            await update.message.reply_text("Илтимос, тугмалардан фойдаланинг:", reply_markup=get_main_keyboard(db_user['role']))
+        return ConversationHandler.END
+    
+    text = update.message.text.strip()
+    
+    if action == 'adddebt':
+        step = context.user_data.get('step', 'name')
+        if step == 'name':
+            context.user_data['debt_name'] = text
+            context.user_data['step'] = 'phone'
+            await update.message.reply_text("📞 **Телефон рақамини** ёзинг (ёки /skip юборинг):", parse_mode="Markdown")
+            return NAME
+        elif step == 'phone':
+            if text == "/skip":
+                context.user_data['debt_phone'] = ""
+            else:
+                context.user_data['debt_phone'] = text
+            context.user_data['step'] = 'amount'
+            await update.message.reply_text("💰 **Қарз суммасини** ёзинг (масалан, 150.50):", parse_mode="Markdown")
+            return AMOUNT
+        elif step == 'amount':
+            try:
+                amount = float(text)
+                if amount <= 0:
+                    raise ValueError
+                context.user_data['debt_amount'] = amount
+                context.user_data['step'] = 'notes'
+                await update.message.reply_text("📝 **Изоҳ** ёзинг (ихтиёрий, ёки /skip):", parse_mode="Markdown")
+                return NOTES
+            except:
+                await update.message.reply_text("❌ Хато сумма. Ижобий сон ёзинг:")
+                return AMOUNT
+        elif step == 'notes':
+            if text == "/skip":
+                notes = ""
+            else:
+                notes = text
+            debt_id = add_debt(
+                context.user_data['debt_name'],
+                context.user_data['debt_phone'],
+                context.user_data['debt_amount'],
+                notes,
+                update.effective_user.id
+            )
+            await update.message.reply_text(f"✅ Қарз қўшилди! ID: `{debt_id}`", parse_mode="Markdown")
+            context.user_data.clear()
+            db_user = get_user(update.effective_user.id)
+            await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+            return ConversationHandler.END
+    
+    elif action == 'pay':
+        if 'pay_debt_id' not in context.user_data:
+            try:
+                debt_id = int(text)
+                debt = get_debt(debt_id)
+                if not debt:
+                    await update.message.reply_text("❌ Қарз топилмади. Тўғри ID ёзинг:")
+                    return DEBT_ID
+                context.user_data['pay_debt_id'] = debt_id
+                await update.message.reply_text(f"Қарз: {debt['customer_name']} дан {debt['remaining_balance']:.2f} сўм қарз.\nТўлов суммасини ёзинг:")
+                return PAY_AMOUNT
+            except ValueError:
+                await update.message.reply_text("Нотўғри ID. Рақамли ID ёзинг:")
+                return DEBT_ID
+        else:
+            try:
+                amount = float(text)
+                if amount <= 0:
+                    raise ValueError
+                debt_id = context.user_data['pay_debt_id']
+                if add_payment(debt_id, amount):
+                    new_debt = get_debt(debt_id)
+                    await update.message.reply_text(f"✅ Тўлов қабул қилинди! Қолган қарз: {new_debt['remaining_balance']:.2f}")
+                else:
+                    await update.message.reply_text("❌ Тўлов амалга ошмади. Суммани текширинг.")
+            except:
+                await update.message.reply_text("Нотўғри сумма.")
+            context.user_data.clear()
+            db_user = get_user(update.effective_user.id)
+            await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+            return ConversationHandler.END
+    
+    elif action == 'editdebt':
+        if 'edit_debt_id' not in context.user_data:
+            try:
+                debt_id = int(text)
+                debt = get_debt(debt_id)
+                if not debt:
+                    await update.message.reply_text("Қарз топилмади. Тўғри ID ёзинг:")
+                    return DEBT_ID
+                context.user_data['edit_debt_id'] = debt_id
+                keyboard = [
+                    [InlineKeyboardButton("Мизож исми", callback_data="edit_name")],
+                    [InlineKeyboardButton("Телефон рақам", callback_data="edit_phone")],
+                    [InlineKeyboardButton("Қарз суммаси", callback_data="edit_amount")],
+                    [InlineKeyboardButton("Изоҳ", callback_data="edit_notes")],
+                    [InlineKeyboardButton("Бекор қилиш", callback_data="edit_cancel")]
+                ]
+                await update.message.reply_text(f"Қарз #{debt_id} ({debt['customer_name']}) таҳрирланмоқда. Нимани ўзгартирасиз?", reply_markup=InlineKeyboardMarkup(keyboard))
+                return EDIT_FIELD
+            except ValueError:
+                await update.message.reply_text("Нотўғри ID. Рақамли ID ёзинг:")
+                return DEBT_ID
+    
+    elif action == 'deletedebt':
         try:
-            telegram_id = int(update.message.text.strip())
+            debt_id = int(text)
+            debt = get_debt(debt_id)
+            if not debt:
+                await update.message.reply_text("Қарз топилмади. Тўғри ID ёзинг:")
+                return DEBT_ID
+            delete_debt(debt_id)
+            await update.message.reply_text(f"✅ Қарз #{debt_id} ўчирилди.")
+        except ValueError:
+            await update.message.reply_text("Нотўғри ID.")
+        context.user_data.clear()
+        db_user = get_user(update.effective_user.id)
+        await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+        return ConversationHandler.END
+    
+    elif action == 'search':
+        debts = search_debts(text)
+        if not debts:
+            await update.message.reply_text("Қарзлар топилмади.")
+        else:
+            msg = "🔍 **Қидирув натижалари:**\n\n"
+            for d in debts[:20]:
+                msg += f"ID: `{d['id']}` | {d['customer_name']} | {d['phone'] or '-'} | Қолдиқ: {d['remaining_balance']:.2f}\n"
+            if len(debts) > 20:
+                msg += f"\n... ва яна {len(debts)-20} та. Аниқроқ сўз ёзинг."
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        context.user_data.clear()
+        db_user = get_user(update.effective_user.id)
+        await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+        return ConversationHandler.END
+    
+    elif action == 'adduser':
+        try:
+            telegram_id = int(text)
+            existing = get_user(telegram_id)
+            if existing:
+                await update.message.reply_text(f"Фойдаланувчи мавжуд, роли: {existing['role']}.")
+                context.user_data.clear()
+                db_user = get_user(update.effective_user.id)
+                await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+                return ConversationHandler.END
             context.user_data['new_user_id'] = telegram_id
             context.user_data['action'] = 'adduser_role'
-            await update.message.reply_text("Xodimga beriladigan rolni yozing (admin / seller / viewer):")
+            await update.message.reply_text("Ролни ёзинг (admin / seller / viewer):")
             return USER_ROLE
         except ValueError:
-            await update.message.reply_text("Noto'g'ri format. Raqamli Telegram ID yuboring:")
+            await update.message.reply_text("Нотўғри ID. Рақамли Telegram ID ёзинг:")
             return USER_ID
+    
     elif action == 'adduser_role':
-        role = update.message.text.strip().lower()
+        role = text.lower()
         if role not in ("admin", "seller", "viewer"):
-            await update.message.reply_text("Noto'g'ri tanlov. Faqat (admin, seller yoki viewer) yozing:")
+            await update.message.reply_text("Нотўғри роль. admin, seller ёки viewer ёзинг:")
             return USER_ROLE
-        tid = context.user_data['new_user_id']
-        create_user(tid, "", "Do'kon xodimi", role)
-        await update.message.reply_text(f"✅ Yangi xodim (ID: {tid}) tizimga qo'shildi, roli: {role.upper()}")
+        telegram_id = context.user_data['new_user_id']
+        try:
+            chat = await context.bot.get_chat(telegram_id)
+            username = chat.username or ""
+            first_name = chat.first_name or ""
+        except:
+            username = ""
+            first_name = "Номаълум"
+        create_user(telegram_id, username, first_name, role)
+        await update.message.reply_text(f"✅ {telegram_id} ID ли фойдаланувчи {role.upper()} роли билан қўшилди.")
         context.user_data.clear()
+        db_user = get_user(update.effective_user.id)
+        await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
         return ConversationHandler.END
+    
+    elif action == 'removeuser':
+        try:
+            telegram_id = int(text)
+            if telegram_id == update.effective_user.id:
+                await update.message.reply_text("Ўзингизни ўчиролмайсиз.")
+            elif delete_user(telegram_id):
+                await update.message.reply_text(f"✅ {telegram_id} ID ли фойдаланувчи ўчирилди.")
+            else:
+                await update.message.reply_text("Фойдаланувчи топилмади.")
+        except ValueError:
+            await update.message.reply_text("Нотўғри ID.")
+        context.user_data.clear()
+        db_user = get_user(update.effective_user.id)
+        await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+        return ConversationHandler.END
+    
+    return ConversationHandler.END
+
+async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    if action == "edit_cancel":
+        await query.edit_message_text("Таҳрирлаш бекор қилинди.")
+        context.user_data.clear()
+        db_user = get_user(query.from_user.id)
+        await query.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+        return ConversationHandler.END
+    field = action.split("_")[1]
+    context.user_data['edit_field'] = field
+    await query.edit_message_text(f"Янги {field} ни ёзинг:")
+    return EDIT_VALUE
+
+async def edit_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    field = context.user_data['edit_field']
+    new_value = update.message.text.strip()
+    debt_id = context.user_data['edit_debt_id']
+    if field == "amount":
+        try:
+            new_amount = float(new_value)
+            if new_amount <= 0:
+                raise ValueError
+            update_debt(debt_id, amount_owed=new_amount, remaining_balance=new_amount)
+        except:
+            await update.message.reply_text("Нотўғри сумма.")
+            return EDIT_FIELD
+    elif field == "name":
+        update_debt(debt_id, customer_name=new_value)
+    elif field == "phone":
+        update_debt(debt_id, phone=new_value)
+    elif field == "notes":
+        update_debt(debt_id, notes=new_value)
+    await update.message.reply_text(f"✅ {field} янгиланди.")
+    context.user_data.clear()
+    db_user = get_user(update.effective_user.id)
+    await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Амал бекор қилинди.")
+    context.user_data.clear()
+    db_user = get_user(update.effective_user.id)
+    if db_user:
+        await update.message.reply_text("Асосий меню:", reply_markup=get_main_keyboard(db_user['role']))
+    return ConversationHandler.END
 
 def run_telegram_bot():
+    """This function runs the Telegram bot in a separate thread."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
     req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(req).build()
+
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_handler)],
         states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
+            NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
+            DEBT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
+            PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
+            EDIT_FIELD: [CallbackQueryHandler(edit_callback)],
+            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value_handler)],
+            SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
             USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
             USER_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
         },
-        fallbacks=[]
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
+
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
+
     logging.info("Telegram bot started.")
     app.run_polling(stop_signals=None)
 
-# ---------- Entry Point ----------
+# ---------- Main Entry Point ----------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Initialize connection to PostgreSQL database
     init_db()
-    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    
+    bot_thread = threading.Thread(target=run_telegram_bot)
+    bot_thread.daemon = True
     bot_thread.start()
+    
     port = int(os.environ.get('PORT', 5000))
-    logging.info(f"Starting Flask on port {port}")
+    logging.info(f"Starting Flask web server on port {port}")
     flask_app.run(host='0.0.0.0', port=port)
