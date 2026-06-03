@@ -74,7 +74,6 @@ def init_db():
         )
     ''')
     
-    # Schema Migration: Safely ensure first_name column exists if an old schema is present
     try:
         cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;")
     except Exception:
@@ -308,11 +307,89 @@ def get_largest_debtors(limit: int = 5) -> List[Dict]:
     conn.close()
     return [{"name": r[0], "phone": r[1], "total": r[2]} for r in rows]
 
+# ---------- Group Topic Report Broadcast Logic ----------
+async def send_daily_report_to_group(app: Application, group_id: int, topic_id: Optional[int] = None):
+    """Compiles snapshot stats and pushes data directly into a specific Telegram Group Topic."""
+    now = datetime.now()
+    debts = get_all_debts()
+    total_out = get_total_outstanding()
+    active_count = len([d for d in debts if d['remaining_balance'] > 0])
+    by_seller = get_outstanding_by_seller()
+    largest = get_largest_debtors(5)
+    
+    msg = (
+        f"📋 **КУНЛИК АВТОМАТИК ҚАРЗЛАР ҲИСОБОТИ**\n"
+        f"📆 Сана: {now.strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"💸 Жами бозордаги қарз: **{total_out:,.2f} сўм**\n"
+        f"👥 Фаол қарздорлар сони: **{active_count} та**\n\n"
+        f"📊 **Сотувчилар бўйича қарздорлик:**\n"
+    )
+    for s in by_seller:
+        msg += f"• {s['name']}: {s['total']:,.2f} сўм\n"
+    
+    msg += "\n🔝 **Энг катта қарздорлар (Топ 5):**\n"
+    for d in largest:
+        msg += f"• {d['name']} ({d['phone'] or '-'}): {d['total']:,.2f} сўм\n"
+    
+    msg += "\n📁 *Батафсил маълумотлар Excel/CSV файл сифатида пастда илова қилинди.*"
+    
+    # Generate CSV stream payload
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Мизож номи", "Телефон", "Қарз суммаси", "Қолдиқ", "Изоҳ", "Сотувчи", "Сана"])
+    for d in debts:
+        writer.writerow([d["id"], d["customer_name"], d["phone"], d["amount_owed"], d["remaining_balance"], d["notes"], d["seller_name"], d["created_at"]])
+    
+    csv_bytes = output.getvalue().encode('utf-8')
+    file_stream = io.BytesIO(csv_bytes)
+    file_stream.name = f"Qarz_Hisoboti_{now.strftime('%Y_%m_%d')}.csv"
+    
+    # Use message_thread_id to safely target the requested Forum topic channel
+    await app.bot.send_document(
+        chat_id=group_id,
+        message_thread_id=topic_id,
+        document=file_stream,
+        caption=msg,
+        parse_mode="Markdown"
+    )
+
+async def daily_report_scheduler(app: Application):
+    """Pure-asyncio background loop worker that triggers a group update every day at 21:00 server time."""
+    group_id_str = os.environ.get('BACKUP_GROUP_ID')
+    topic_id_str = os.environ.get('BACKUP_TOPIC_ID')
+    
+    if not group_id_str:
+        logging.info("BACKUP_GROUP_ID environment variable not found. Daily updates disabled.")
+        return
+    try:
+        group_id = int(group_id_str)
+        topic_id = int(topic_id_str) if topic_id_str else None
+    except ValueError:
+        logging.error("Invalid BACKUP_GROUP_ID or BACKUP_TOPIC_ID format. Must be an integer.")
+        return
+
+    logging.info(f"Automatic daily report sequence active targeting group: {group_id} | Topic ID: {topic_id}")
+    last_sent_date = None
+    
+    while True:
+        try:
+            now = datetime.now()
+            # Triggers automatic delivery every day at 21:00 (9:00 PM) server time
+            if now.hour == 21 and now.minute == 0 and last_sent_date != now.date():
+                logging.info("Scheduled trigger time matched! Sending group update to topic...")
+                await send_daily_report_to_group(app, group_id, topic_id)
+                last_sent_date = now.date()
+                logging.info("Scheduled update completed.")
+        except Exception as e:
+            logging.error(f"Error occurring inside automated daily scheduler runner loop: {e}")
+            
+        await asyncio.sleep(60)
+
 # ---------- Telegram Handlers ----------
 NAME, PHONE, AMOUNT, NOTES, DEBT_ID, PAY_AMOUNT, EDIT_FIELD, EDIT_VALUE, SEARCH_QUERY, USER_ID, USER_ROLE = range(11)
 
 def get_main_keyboard(role: str):
-    if role == "admin":
+    if role in ("admin", "seller"):
         keyboard = [
             [InlineKeyboardButton("➕ Қарз қўшиш", callback_data="menu_adddebt")],
             [InlineKeyboardButton("💰 Тўлов қабул қилиш", callback_data="menu_pay")],
@@ -322,21 +399,11 @@ def get_main_keyboard(role: str):
             [InlineKeyboardButton("📋 Барча қарзлар", callback_data="menu_listdebts")],
             [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
             [InlineKeyboardButton("📁 CSV экспорт", callback_data="menu_export")],
-            [InlineKeyboardButton("👥 Фойдаланувчилар", callback_data="menu_users")],
-            [InlineKeyboardButton("❌ Бекор қилиш", callback_data="menu_cancel")]
+            [InlineKeyboardButton("📢 Группага юбориш", callback_data="menu_sendtogroup")]
         ]
-    elif role == "seller":
-        keyboard = [
-            [InlineKeyboardButton("➕ Қарз қўшиш", callback_data="menu_adddebt")],
-            [InlineKeyboardButton("💰 Тўлов қабул қилиш", callback_data="menu_pay")],
-            [InlineKeyboardButton("✏️ Қарзни таҳрирлаш", callback_data="menu_editdebt")],
-            [InlineKeyboardButton("🗑️ Қарзни ўчириш", callback_data="menu_deletedebt")],
-            [InlineKeyboardButton("🔍 Қарзларни излаш", callback_data="menu_search")],
-            [InlineKeyboardButton("📋 Барча қарзлар", callback_data="menu_listdebts")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
-            [InlineKeyboardButton("📁 CSV экспорт", callback_data="menu_export")],
-            [InlineKeyboardButton("❌ Бекор қилиш", callback_data="menu_cancel")]
-        ]
+        if role == "admin":
+            keyboard.append([InlineKeyboardButton("👥 Фойдаланувчилар", callback_data="menu_users")])
+        keyboard.append([InlineKeyboardButton("❌ Бекор қилиш", callback_data="menu_cancel")])
     else:
         keyboard = [
             [InlineKeyboardButton("🔍 Қарзларни излаш", callback_data="menu_search")],
@@ -396,7 +463,22 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = query.data
     role = db_user['role']
     
-    if action == "menu_adddebt":
+    if action == "menu_sendtogroup":
+        group_id_str = os.environ.get('BACKUP_GROUP_ID')
+        topic_id_str = os.environ.get('BACKUP_TOPIC_ID')
+        if not group_id_str:
+            await query.edit_message_text("❌ Хато: BACKUP_GROUP_ID муҳит ўзгарувчиси киритилмаган!", reply_markup=get_main_keyboard(role))
+            return
+        try:
+            await query.edit_message_text("⏳ Ҳисобот ва файл белгиланган мавзуга (topic) юборилмоқда...")
+            t_id = int(topic_id_str) if topic_id_str else None
+            await send_daily_report_to_group(context.application, int(group_id_str), t_id)
+            await query.edit_message_text("✅ Кунлик қарзлар ҳисоботи группа мавзусига муваффақиятли юборилди!", reply_markup=get_main_keyboard(role))
+        except Exception as e:
+            await query.edit_message_text(f"❌ Хатолик юз берди: {str(e)}", reply_markup=get_main_keyboard(role))
+        return
+        
+    elif action == "menu_adddebt":
         if role not in ("admin", "seller"):
             await query.edit_message_text("⛔ Фақат сотувчилар ва adminлар қарз қўша олади.", reply_markup=get_main_keyboard(role))
             return
@@ -406,7 +488,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == "menu_pay":
         if role not in ("admin", "seller"):
-            await query.edit_message_text("⛔ Ҳуқуқингиз йўқ.", reply_markup=get_main_keyboard(role))
+            await query.edit_message_text("⛔  Ҳуқуқингиз йўқ.", reply_markup=get_main_keyboard(role))
             return
         context.user_data['action'] = 'pay'
         await query.edit_message_text("💰 **Тўлов қабул қилиш**\n\nҚарзнинг **ID рақамини** ёзинг:", parse_mode="Markdown")
@@ -759,7 +841,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def main_bot_async():
-    """Asynchronous entry point that manages the bot lifecycle safely in an isolated event loop context."""
+    """Asynchronous entry point that manages the bot lifecycle safely."""
     req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(req).build()
 
@@ -788,8 +870,12 @@ async def main_bot_async():
     logging.info("Telegram bot initializing...")
     await app.initialize()
     await app.start()
+    
+    # Spawn the topic-aware background scheduler loop
+    asyncio.create_task(daily_report_scheduler(app))
+    
     await app.updater.start_polling()
-    logging.info("Telegram bot started polling successfully.")
+    logging.info("Telegram bot started polling safely.")
     
     try:
         while True:
@@ -800,14 +886,12 @@ async def main_bot_async():
         await app.shutdown()
 
 def run_telegram_bot():
-    """This function safely boots up the bot context within its assigned background thread thread loop."""
     asyncio.run(main_bot_async())
 
 # ---------- Main Entry Point ----------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    # Initialize connection and verify schemas inside PostgreSQL database
     init_db()
     
     bot_thread = threading.Thread(target=run_telegram_bot)
