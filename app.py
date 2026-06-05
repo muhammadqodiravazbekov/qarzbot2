@@ -488,7 +488,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == "menu_pay":
         if role not in ("admin", "seller"):
-            await query.edit_message_text("⛔  Ҳуқуқингиз йўқ.", reply_markup=get_main_keyboard(role))
+            await query.edit_message_text("⛔ Ҳуқуқингиз йўқ.", reply_markup=get_main_keyboard(role))
             return
         context.user_data['action'] = 'pay'
         await query.edit_message_text("💰 **Тўлов қабул қилиш**\n\nҚарзнинг **ID рақамини** ёзинг:", parse_mode="Markdown")
@@ -860,7 +860,12 @@ async def main_bot_async():
             USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
             USER_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+            CallbackQueryHandler(menu_handler)
+        ],
+        allow_reentry=True
     )
 
     app.add_handler(conv_handler)
