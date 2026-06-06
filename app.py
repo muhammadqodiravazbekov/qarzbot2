@@ -7,26 +7,26 @@ import asyncio
 import threading
 import unicodedata
 import psycopg2
-from psycopg2.pool import ThreadedConnectionPool  # Оптималлаштириш учун қўшилди
+from psycopg2.pool import ThreadedConnectionPool
 from datetime import datetime
 from typing import List, Dict, Optional
 from flask import Flask, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
     MessageHandler, CallbackQueryHandler, filters, ContextTypes
 )
 from telegram.request import HTTPXRequest
 
-# ---------- Flask Веб Сервер ----------
+# ---------- Flask Веб Сервер (Render узилиб қолмаслиги учун) ----------
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 @flask_app.route('/health')
 def health():
-    return jsonify({"status": "alive", "message": "Bot is running perfectly!"}), 200
+    return jsonify({"status": "alive", "message": "Бот муваффақиятли ишлаяпти!"}), 200
 
-# ---------- Конфигурация ----------
+# ---------- Конфигурация ва Муҳит Ўзгарувчилари ----------
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 DATABASE_URL = os.environ.get('DATABASE_URL')
 BACKUP_GROUP_ID = os.environ.get('BACKUP_GROUP_ID')
@@ -35,8 +35,7 @@ BACKUP_TOPIC_ID = os.environ.get('BACKUP_TOPIC_ID')
 if not BOT_TOKEN or not DATABASE_URL:
     raise ValueError("Жиддий хато: BOT_TOKEN ёки DATABASE_URL муҳит ўзгарувчилари топилмади!")
 
-# ---------- 1-Оптималлаштириш: Connection Pool яратиш ----------
-# Минимал 1 та, максимал 20 та уланишни доим очиқ ва тайёр ҳолатда сақлайди
+# ---------- Тезкор уланиш учун Connection Pool ----------
 db_pool = ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
 
 def get_db_connection():
@@ -45,17 +44,15 @@ def get_db_connection():
 def release_db_connection(conn):
     db_pool.putconn(conn)
 
-# ---------- Суҳбат Ҳолатлари ----------
+# ---------- Суҳбат Ҳолатлари (Conversation States) ----------
 (
     ADD_NAME, ADD_PHONE, ADD_AMOUNT, ADD_NOTES,
     EXIST_SEARCH, EXIST_SELECT, EXIST_AMOUNT,
     PAY_DEBT_ID, PAY_AMOUNT,
-    EDIT_DEBT_ID, EDIT_FIELD, EDIT_VALUE,
-    DELETE_DEBT_ID, SEARCH_QUERY,
-    USER_ID, USER_ROLE
-) = range(16)
+    SEARCH_QUERY
+) = range(10)
 
-# ---------- Ёрдамчи Функциялар ----------
+# ---------- Матнни Нормализация қилиш (Қидирув осон бўлиши учун) ----------
 def normalize_text(text: str) -> str:
     if not text: return ""
     cyrillic_to_latin = {
@@ -72,7 +69,8 @@ def normalize_text(text: str) -> str:
     normalized = unicodedata.normalize('NFKD', normalized).encode('ASCII', 'ignore').decode('ASCII')
     return re.sub(r'[^a-z0-9]', '', normalized)
 
-async def send_backup(context: ContextTypes.DEFAULT_TYPE, message: str):
+# ---------- Тезкор хабар бэкапини гуруҳга юбориш функцияси ----------
+async def send_backup_message(context: ContextTypes.DEFAULT_TYPE, message: str):
     if BACKUP_GROUP_ID:
         try:
             kwargs = {"chat_id": int(BACKUP_GROUP_ID), "text": message, "parse_mode": "Markdown"}
@@ -80,9 +78,9 @@ async def send_backup(context: ContextTypes.DEFAULT_TYPE, message: str):
                 kwargs["message_thread_id"] = int(BACKUP_TOPIC_ID)
             await context.bot.send_message(**kwargs)
         except Exception as e:
-            logging.error(f"Бэкап юборишда хатолик: {e}")
+            logging.error(f"Гуруҳга хабар юборишда хатолик: {e}")
 
-# ---------- Маълумотлар Базаси Амаллари (Пулдан фойдаланади) ----------
+# ---------- Маълумотлар Базаси билан Ишлаш ----------
 def init_db():
     conn = get_db_connection()
     try:
@@ -206,16 +204,6 @@ def update_debt(debt_id: int, **kwargs) -> bool:
     finally:
         release_db_connection(conn)
 
-def delete_debt(debt_id: int) -> bool:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM debts WHERE id = %s", (debt_id,))
-            conn.commit()
-            return cursor.rowcount > 0
-    finally:
-        release_db_connection(conn)
-
 def add_payment(debt_id: int, amount: float, notes: str = "") -> bool:
     debt = get_debt(debt_id)
     if not debt or amount <= 0 or amount > debt["remaining_balance"]:
@@ -295,113 +283,119 @@ def get_largest_debtors(limit: int = 5) -> List[Dict]:
     finally:
         release_db_connection(conn)
 
-# ---------- Клавиатуралар ----------
-def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
+# ---------- Пастки Доимий Меню (ReplyKeyboardMarkup - "Тўртта Тўртбурчак") ----------
+def get_main_reply_keyboard(role: str) -> ReplyKeyboardMarkup:
     keyboard = []
+    
+    # Фақат админ ва сотувчилар кўрадиган тугмалар
     if role in ("admin", "seller"):
-        keyboard.append([InlineKeyboardButton("➕ Янги мизож ва қарз", callback_data="menu_adddebt")])
-        keyboard.append([InlineKeyboardButton("➕ Мавжуд мизожга қарз", callback_data="menu_existdebt")])
-        keyboard.append([InlineKeyboardButton("💰 Тўлов қабул қилиш", callback_data="menu_pay")])
-        keyboard.append([InlineKeyboardButton("✏️ Қарзни таҳрирлаш", callback_data="menu_editdebt")])
-        keyboard.append([InlineKeyboardButton("🗑️ Қарзни ўчириш", callback_data="menu_deletedebt")])
-    keyboard.extend([
-        [InlineKeyboardButton("🔍 Қарзларни излаш", callback_data="menu_search")],
-        [InlineKeyboardButton("📋 Барча қарзлар рўйхати", callback_data="menu_listdebts")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
-        [InlineKeyboardButton("📁 CSV Экспорт", callback_data="menu_export")],
-        [InlineKeyboardButton("❌ Амални бекор қилиш", callback_data="menu_cancel")]
-    ])
-    return InlineKeyboardMarkup(keyboard)
+        keyboard.append([KeyboardButton("➕ Янги мизож ва қарз"), KeyboardButton("➕ Мавжуд мизожга қарз")])
+        keyboard.append([KeyboardButton("💰 Тўлов қабул қилиш"), KeyboardButton("❌ Амални бекор қилиш")])
+    
+    # Ҳамма кўра оладиган тугмалар
+    keyboard.append([KeyboardButton("🔍 Qарзларни излаш"), KeyboardButton("📋 Барча қарзлар рўйхати")])
+    
+    # CSV экспорт ўрнига тўғридан-тўғри гуруҳга бэкап юбориш тугмаси қўшилди
+    keyboard.append([KeyboardButton("📊 Статистика"), KeyboardButton("📢 Гуруҳга Бэкап юбориш")])
+    
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ---------- 2-Оптималлаштириш: Ижрочиларга юбориш (asyncio.to_thread) ----------
-# Энди ҳар бир handler ичида базага тегадиган функциялар "await asyncio.to_thread(функция, аргументлар)" шаклида чақирилади.
-
+# ---------- Бот Старт Функцияси ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db_user = await asyncio.to_thread(get_user, user.id) # Оптимал: Оқим блок бўлмайди
+    db_user = await asyncio.to_thread(get_user, user.id)
     
     if not db_user:
         admins_sellers = await asyncio.to_thread(get_admins_and_sellers)
         if not admins_sellers:
+            # Агар база бўм-бўш бўлса, биринчи старт берган одам автоматик АДМИН бўлади
             await asyncio.to_thread(create_user, user.id, user.username or "", user.first_name or "", "admin")
-            await update.message.reply_text(f"✅ {user.first_name}, сиз АДМИН этиб тайинландингиз.", reply_markup=get_main_keyboard("admin"))
+            await update.message.reply_text(f"✅ {user.first_name}, сиз тизимга АДМИН этиб тайинландингиз.", reply_markup=get_main_reply_keyboard("admin"))
         else:
-            await update.message.reply_text("❌ Кириш тақиқланган. Админ рухсати зарур.")
+            await update.message.reply_text("❌ Кириш тақиқланган. Тизимдан фойдаланиш учун Админ рухсати зарур.")
         return
         
-    await update.message.reply_text(f"Тизим тайёр. Ролингиз: {db_user['role'].upper()}", reply_markup=get_main_keyboard(db_user['role']))
+    await update.message.reply_text("Тизим тайёр. Пастки менюдан фойдаланишингиз мумкин:", reply_markup=get_main_reply_keyboard(db_user['role']))
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer() # Телеграмга тугма босилгани ҳақида тезкор сигнал юбориш
-    
-    db_user = await asyncio.to_thread(get_user, query.from_user.id)
-    if not db_user:
-        await query.edit_message_text("Рухсатингиз йўқ.")
-        return ConversationHandler.END
-        
-    action = query.data
-    role = db_user['role']
-    
-    if action == "menu_adddebt":
-        if role not in ("admin", "seller"): return ConversationHandler.END
-        await query.edit_message_text("👤 Мизож исмини киритинг:")
-        return ADD_NAME
-        
-    elif action == "menu_existdebt":
-        await query.edit_message_text("🔍 Кўпайтирилмоқчи бўлган мизож исми ёки телини киритинг:")
-        return EXIST_SEARCH
-        
-    elif action == "menu_pay":
-        await query.edit_message_text("💰 Тўлов қабул қилиш учун қарзнинг **ID рақамини** киритинг:")
-        return PAY_DEBT_ID
-        
-    elif action == "menu_listdebts":
-        debts = await asyncio.to_thread(get_all_debts)
-        if not debts:
-            await query.edit_message_text("📋 Қарзлар топилмади.", reply_markup=get_main_keyboard(role))
-        else:
-            msg = "📋 **Қарздорлар рўйхати (Охирги 15 та):**\n\n"
-            for d in debts[:15]:
-                msg += f"🆔 `ID: {d['id']}` | {d['customer_name']} | 💰 Қолдиқ: **{d['remaining_balance']:.2f}**\n"
-            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_main_keyboard(role))
-        return ConversationHandler.END
-        
-    elif action == "menu_stats":
-        total = await asyncio.to_thread(get_total_outstanding)
-        by_seller = await asyncio.to_thread(get_outstanding_by_seller)
-        largest = await asyncio.to_thread(get_largest_debtors, 5)
-        
-        msg = f"📊 **Умумий Статистика**\n\n💸 Умумий қарзлар: **{total:.2f}**\n\n"
-        msg += "**Сотувчилар бўйича:**\n"
-        for s in by_seller: msg += f"• {s['name']}: {s['total']:.2f}\n"
-        msg += "\n**Энг йирик қарздорлар:**\n"
-        for d in largest: msg += f"• {d['name']}: **{d['total']:.2f}**\n"
-        
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_main_keyboard(role))
-        return ConversationHandler.END
-        
-    elif action == "menu_export":
-        debts = await asyncio.to_thread(get_all_debts)
-        if not debts: return ConversationHandler.END
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["ID", "Name", "Phone", "Balance"])
-        for d in debts: writer.writerow([d["id"], d["customer_name"], d["phone"], d["remaining_balance"]])
-        output.seek(0)
-        await query.edit_message_text("📁 Файл юборилмоқда...", reply_markup=get_main_keyboard(role))
-        await query.message.reply_document(document=io.BytesIO(output.getvalue().encode()), filename="qarzlar.csv")
-        return ConversationHandler.END
-        
-    elif action == "menu_cancel":
-        context.user_data.clear()
-        await query.edit_message_text("Амал бекор қилинди.", reply_markup=get_main_keyboard(role))
-        return ConversationHandler.END
+# ---------- Пастки Меню Амаллари Бошланиши (Entry Points) ----------
+async def add_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👤 Мизож исми ва фамилиясини киритинг:")
+    return ADD_NAME
 
-# ---------- Стейт Давомчилари (Thread-safe қилинган талқинлари) ----------
+async def exist_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Қарзи кўпайтириладиган мизож исми ёки телефонини киритинг:")
+    return EXIST_SEARCH
+
+async def pay_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💰 Тўлов қабул қилиш учун қарздорликнинг **ID рақамини** киритинг:")
+    return PAY_DEBT_ID
+
+async def search_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Қидирилаётган мизож исми ёки телефонини ёзинг:")
+    return SEARCH_QUERY
+
+# ---------- Тезкор Тугмалар Ишловчилари (Non-blocking Handlers) ----------
+async def list_debts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    debts = await asyncio.to_thread(get_all_debts)
+    if not debts:
+        await update.message.reply_text("📋 Қарздорлар топилмади.")
+    else:
+        msg = "📋 **Қарздорлар рўйхати (Охирги 15 та):**\n\n"
+        for d in debts[:15]:
+            msg += f"🆔 `ID: {d['id']}` | {d['customer_name']} | 💰 Қолдиқ: **{d['remaining_balance']:.2f}**\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total = await asyncio.to_thread(get_total_outstanding)
+    by_seller = await asyncio.to_thread(get_outstanding_by_seller)
+    largest = await asyncio.to_thread(get_largest_debtors, 5)
+    
+    msg = f"📊 **Умумий Статистика**\n\n💸 Умумий жамланган қарз: **{total:.2f}**\n\n"
+    msg += "**Сотувчилар кесимида:**\n"
+    for s in by_seller: msg += f"• {s['name']}: {s['total']:.2f}\n"
+    msg += "\n**Энг йирик қарздорлар:**\n"
+    for d in largest: msg += f"• {d['name']}: **{d['total']:.2f}**\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+# 📢 Тўғридан-тўғри Гуруҳга файл юборувчи функция (Сиз сўраган янгиланиш)
+async def send_backup_to_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    debts = await asyncio.to_thread(get_all_debts)
+    if not debts:
+        await update.message.reply_text("Базада маълумот мавжуд эмас.")
+        return
+        
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Name", "Phone", "Balance"])
+    for d in debts: 
+        writer.writerow([d["id"], d["customer_name"], d["phone"], d["remaining_balance"]])
+    output.seek(0)
+    
+    if BACKUP_GROUP_ID:
+        try:
+            kwargs = {
+                "chat_id": int(BACKUP_GROUP_ID),
+                "document": io.BytesIO(output.getvalue().encode()),
+                "filename": f"qarzlar_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "caption": f"📢 **БАЗА ТЎЛИҚ БЭКАПИ**\n👤 Масъул: {update.effective_user.first_name}\n📅 Сана: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                "parse_mode": "Markdown"
+            }
+            if BACKUP_TOPIC_ID:
+                kwargs["message_thread_id"] = int(BACKUP_TOPIC_ID)
+                
+            await context.bot.send_document(**kwargs)
+            await update.message.reply_text("📢 Тўлиқ CSV бэкап файли белгиланган масъул гуруҳга муваффақиятли юборилди!")
+        except Exception as e:
+            logging.error(f"Гуруҳга бэкап юборишда хатолик: {e}")
+            await update.message.reply_text("❌ Гуруҳга бэкап юборишда хатолик юз берди.")
+    else:
+        await update.message.reply_text("❌ Бэкап гуруҳ ID си (BACKUP_GROUP_ID) муҳит ўзгарувчиларига созланмаган.")
+
+# ---------- Суҳбат Қадамлари Ишловчилари ----------
 async def add_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['debt_name'] = update.message.text.strip()
-    await update.message.reply_text("📞 Телефон рақамини киритинг (ёки /skip):")
+    await update.message.reply_text("📞 Телефон рақамини киритинг (ўтказиб юбориш учун /skip):")
     return ADD_PHONE
 
 async def add_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -413,10 +407,10 @@ async def add_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         context.user_data['debt_amount'] = float(update.message.text.strip())
-        await update.message.reply_text("📝 Изоҳ ёзинг (ёки /skip):")
+        await update.message.reply_text("📝 Қўшимча изоҳ ёзинг (ёки /skip):")
         return ADD_NOTES
     except ValueError:
-        await update.message.reply_text("❌ Сон киритинг:")
+        await update.message.reply_text("❌ Илтимос фақат сон киритинг:")
         return ADD_AMOUNT
 
 async def add_notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -427,21 +421,20 @@ async def add_notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_debt, context.user_data['debt_name'], context.user_data['debt_phone'],
         context.user_data['debt_amount'], notes, update.effective_user.id
     )
-    await update.message.reply_text(f"✅ Ёзилди! ID: `{debt_id}`", parse_mode="Markdown")
-    await send_backup(context, f"➕ **ЯНГИ ҚАРЗ**\nМизож: {context.user_data['debt_name']}\nСумма: {context.user_data['debt_amount']:.2f}")
+    await update.message.reply_text(f"✅ Муваффақиятли базага ёзилди! ID: `{debt_id}`", parse_mode="Markdown")
+    await send_backup_message(context, f"➕ **ЯНГИ ҚАРЗ**\nМизож: {context.user_data['debt_name']}\nСумма: {context.user_data['debt_amount']:.2f}")
     context.user_data.clear()
     return ConversationHandler.END
 
 async def exist_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     results = await asyncio.to_thread(search_debts, text)
-    if not results:
-        await update.message.reply_text("❌ Топилмади. Қайта урининг:")
+    if not map or not results:
+        await update.message.reply_text("❌ Бундай мизож топилмади. Қайта қидириб кўринг:")
         return EXIST_SEARCH
         
     buttons = [[InlineKeyboardButton(f"{r['customer_name']} (🆔 {r['id']})", callback_data=f"sel_{r['id']}")] for r in results[:8]]
-    buttons.append([InlineKeyboardButton("❌ Бекор қилиш", callback_data="menu_cancel")])
-    await update.message.reply_text("👇 Рўйхатдан танланг:", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text("👇 Рўйхатдан кераклисини танланг:", reply_markup=InlineKeyboardMarkup(buttons))
     return EXIST_SELECT
 
 async def exist_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -450,7 +443,7 @@ async def exist_select_callback(update: Update, context: ContextTypes.DEFAULT_TY
     debt_id = int(query.data.split("_")[1])
     context.user_data['selected_debt_id'] = debt_id
     debt = await asyncio.to_thread(get_debt, debt_id)
-    await query.edit_message_text(f"👤 Мизож: *{debt['customer_name']}*\nҚўшиладиган янги суммани ёзинг:", parse_mode="Markdown")
+    await query.edit_message_text(f"👤 Мизож: *{debt['customer_name']}*\n\nҚўшиладиган янги суммани киритинг:", parse_mode="Markdown")
     return EXIST_AMOUNT
 
 async def exist_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,10 +455,10 @@ async def exist_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             new_owed = debt['amount_owed'] + amount
             new_balance = debt['remaining_balance'] + amount
             await asyncio.to_thread(update_debt, debt_id, amount_owed=new_owed, remaining_balance=new_balance)
-            await update.message.reply_text(f"✅ Қўшилди. Янги қолдиқ: **{new_balance:.2f}**", parse_mode="Markdown")
-            await send_backup(context, f"🔄 **ҚАРЗ КЎПАЙТИРИЛДИ**\nМизож: {debt['customer_name']}\nҚўшилди: {amount:.2f}")
+            await update.message.reply_text(f"✅ Қарз суммаси оширилди. Янги қолдиқ: **{new_balance:.2f}**", parse_mode="Markdown")
+            await send_backup_message(context, f"🔄 **ҚАРЗ ОШИРИЛДИ**\nМизож: {debt['customer_name']}\nҚўшилди: {amount:.2f}\nЖорий қолдиқ: {new_balance:.2f}")
     except ValueError:
-        await update.message.reply_text("Сон киритинг:")
+        await update.message.reply_text("Илтимос, тўғри сон киритинг:")
         return EXIST_AMOUNT
     context.user_data.clear()
     return ConversationHandler.END
@@ -475,38 +468,53 @@ async def pay_debt_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         debt_id = int(update.message.text.strip())
         debt = await asyncio.to_thread(get_debt, debt_id)
         if not debt:
-            await update.message.reply_text("❌ Топилмади. Қайта киритинг:")
+            await update.message.reply_text("❌ Бундай ID билан ҳеч қандай қарздорлик топилмади. Қайта киритинг:")
             return PAY_DEBT_ID
         context.user_data['pay_debt_id'] = debt_id
-        await update.message.reply_text(f"👤 Мизож: {debt['customer_name']}\n💸 Қолдиқ: **{debt['remaining_balance']:.2f}**\n\nТўлов суммасини киритинг:")
+        await update.message.reply_text(f"👤 Мизож: {debt['customer_name']}\n💸 Жорий қарз қолдиғи: **{debt['remaining_balance']:.2f}**\n\nОлинган тўлов суммасини киритинг:")
         return PAY_AMOUNT
     except ValueError:
-        await update.message.reply_text("ID рақам бўлиши шарт:")
+        await update.message.reply_text("Хато: ID фақат рақамдан иборат бўлади:")
         return PAY_DEBT_ID
 
 async def pay_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(update.message.text.strip())
         debt_id = context.user_data['pay_debt_id']
-        success = await asyncio.to_thread(add_payment, debt_id, amount)
-        if success:
+        if await asyncio.to_thread(add_payment, debt_id, amount):
             debt = await asyncio.to_thread(get_debt, debt_id)
-            await update.message.reply_text(f"✅ Тўлов олинди. Янги қолдиқ: **{debt['remaining_balance']:.2f}**", parse_mode="Markdown")
-            await send_backup(context, f"💰 **ТЎЛОВ ОЛИНДИ**\nМизож: {debt['customer_name']}\nСумма: {amount:.2f}")
+            await update.message.reply_text(f"✅ Тўлов қабул қилинди. Янги қолдиқ: **{debt['remaining_balance']:.2f}**", parse_mode="Markdown")
+            await send_backup_message(context, f"💰 **ТЎЛОВ ОЛИНДИ**\nМизож: {debt['customer_name']}\nТўлов суммаси: {amount:.2f}\nҚолдиқ қарз: {debt['remaining_balance']:.2f}")
         else:
-            await update.message.reply_text("❌ Хатолик (сумма қолдиқдан катта бўлиши мумкин).")
+            await update.message.reply_text("❌ Хато: Тўлов суммаси жорий умумий қарздан катта бўлиши мумкин эмас.")
     except ValueError:
-        await update.message.reply_text("Тўғри сумма киритинг:")
+        await update.message.reply_text("Илтимос, тўғри сумма киритинг:")
         return PAY_AMOUNT
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def search_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    debts = await asyncio.to_thread(search_debts, text)
+    if not debts:
+        await update.message.reply_text("🔍 Мос келувчи мизож топилмади.")
+    else:
+        msg = "🔍 **Қидирув натижалари:**\n\n"
+        for d in debts[:15]:
+            msg += f"🆔 `ID: {d['id']}` | {d['customer_name']} | 📞 {d['phone'] or '-'} | 💰 Қолдиқ: **{d['remaining_balance']:.2f}**\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
     context.user_data.clear()
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Тўхтатилди.")
+    user_id = update.effective_user.id
+    db_user = await asyncio.to_thread(get_user, user_id)
+    role = db_user['role'] if db_user else "viewer"
+    await update.message.reply_text("🚫 Жорий амал бекор қилинди.", reply_markup=get_main_reply_keyboard(role))
     return ConversationHandler.END
 
-# ---------- Ботни Ишга Тушириш Цикли ----------
+# ---------- Ботни Алоҳида Оқимда Юрғизиш ----------
 def run_telegram_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -515,7 +523,15 @@ def run_telegram_bot():
     app = Application.builder().token(BOT_TOKEN).request(req).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(menu_handler)],
+        entry_points=[
+            MessageHandler(filters.Regex("^➕ Янги мизож ва қарз$"), add_debt_start),
+            MessageHandler(filters.Regex("^➕ Мавжуд мизожга қарз$"), exist_debt_start),
+            MessageHandler(filters.Regex("^💰 Тўлов қабул қилиш$"), pay_debt_start),
+            MessageHandler(filters.Regex("^🔍 Qарзларни излаш$"), search_debt_start),
+            MessageHandler(filters.Regex("^📋 Барча қарзлар рўйхати$"), list_debts_handler),
+            MessageHandler(filters.Regex("^📊 Статистика$"), stats_handler),
+            MessageHandler(filters.Regex("^📢 Гуруҳга Бэкап юбориш$"), send_backup_to_group_handler),
+        ],
         states={
             ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_name_handler)],
             ADD_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_phone_handler)],
@@ -526,8 +542,12 @@ def run_telegram_bot():
             EXIST_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exist_amount_handler)],
             PAY_DEBT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_debt_id_handler)],
             PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_amount_handler)],
+            SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_query_handler)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(menu_handler, pattern="^menu_cancel$")]
+        fallbacks=[
+            CommandHandler("cancel", cancel), 
+            MessageHandler(filters.Regex("^❌ Амални бекор қилиш$"), cancel)
+        ]
     )
 
     app.add_handler(conv_handler)
@@ -535,17 +555,18 @@ def run_telegram_bot():
     
     app.run_polling(stop_signals=None)
 
+# ---------- Дастурни Ишга Тушириш Нуқтаси ----------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    # Базани текшириш
+    # Таблицаларни автоматик текшириш ва яратиш
     init_db()
     
-    # Ботни оқимда юритиш
+    # Ботни орқа фонда ишга тушириш
     bot_thread = threading.Thread(target=run_telegram_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # Flask порт банд қилиш
+    # Flask веб серверни асосий оқимда юрғизиш (Render тизими учун мажбурий)
     port = int(os.environ.get('PORT', 5000))
     flask_app.run(host='0.0.0.0', port=port)
