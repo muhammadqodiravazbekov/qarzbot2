@@ -18,24 +18,24 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-# ---------- Flask Веб Сервер (Render узилиб қолмаслиги учун) ----------
+# ---------- Flask Web Server ----------
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 @flask_app.route('/health')
 def health():
-    return jsonify({"status": "alive", "message": "Бот муваффақиятли ишлаяпти!"}), 200
+    return jsonify({"status": "alive", "message": "Bot is running perfectly!"}), 200
 
-# ---------- Конфигурация ва Муҳит Ўзгарувчилари ----------
+# ---------- Configuration ----------
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 DATABASE_URL = os.environ.get('DATABASE_URL')
 BACKUP_GROUP_ID = os.environ.get('BACKUP_GROUP_ID')
 BACKUP_TOPIC_ID = os.environ.get('BACKUP_TOPIC_ID')
 
 if not BOT_TOKEN or not DATABASE_URL:
-    raise ValueError("Жиддий хато: BOT_TOKEN ёки DATABASE_URL муҳит ўзгарувчилари топилмади!")
+    raise ValueError("CRITICAL ERROR: BOT_TOKEN or DATABASE_URL environment variables are missing!")
 
-# ---------- Тезкор уланиш учун Connection Pool ----------
+# ---------- Connection Pool ----------
 db_pool = ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
 
 def get_db_connection():
@@ -44,7 +44,7 @@ def get_db_connection():
 def release_db_connection(conn):
     db_pool.putconn(conn)
 
-# ---------- Суҳбат Ҳолатлари (Conversation States) ----------
+# ---------- Conversation States ----------
 (
     ADD_NAME, ADD_PHONE, ADD_AMOUNT, ADD_NOTES,
     EXIST_SEARCH, EXIST_SELECT, EXIST_AMOUNT,
@@ -52,7 +52,7 @@ def release_db_connection(conn):
     SEARCH_QUERY
 ) = range(10)
 
-# ---------- Матнни Нормализация қилиш (Қидирув осон бўлиши учун) ----------
+# ---------- Helper Functions ----------
 def normalize_text(text: str) -> str:
     if not text: return ""
     cyrillic_to_latin = {
@@ -69,7 +69,6 @@ def normalize_text(text: str) -> str:
     normalized = unicodedata.normalize('NFKD', normalized).encode('ASCII', 'ignore').decode('ASCII')
     return re.sub(r'[^a-z0-9]', '', normalized)
 
-# ---------- Тезкор хабар бэкапини гуруҳга юбориш функцияси ----------
 async def send_backup_message(context: ContextTypes.DEFAULT_TYPE, message: str):
     if BACKUP_GROUP_ID:
         try:
@@ -78,9 +77,9 @@ async def send_backup_message(context: ContextTypes.DEFAULT_TYPE, message: str):
                 kwargs["message_thread_id"] = int(BACKUP_TOPIC_ID)
             await context.bot.send_message(**kwargs)
         except Exception as e:
-            logging.error(f"Гуруҳга хабар юборишда хатолик: {e}")
+            logging.error(f"Backup send error: {e}")
 
-# ---------- Маълумотлар Базаси билан Ишлаш ----------
+# ---------- Database Setup & Functions ----------
 def init_db():
     conn = get_db_connection()
     try:
@@ -204,18 +203,27 @@ def update_debt(debt_id: int, **kwargs) -> bool:
     finally:
         release_db_connection(conn)
 
-def add_payment(debt_id: int, amount: float, notes: str = "") -> bool:
+# Optimized: Automatically deletes debt record if balance drops to 0.00
+def add_payment(debt_id: int, amount: float, notes: str = "") -> str:
     debt = get_debt(debt_id)
     if not debt or amount <= 0 or amount > debt["remaining_balance"]:
-        return False
+        return "error"
+        
     new_balance = debt["remaining_balance"] - amount
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
             cursor.execute("INSERT INTO payments (debt_id, amount_paid, notes) VALUES (%s, %s, %s)", (debt_id, amount, notes))
-            cursor.execute("UPDATE debts SET remaining_balance = %s, updated_at = %s WHERE id = %s", (new_balance, datetime.now(), debt_id))
-            conn.commit()
-            return True
+            
+            # Auto-Delete Trigger (0.01 threshold for float safety)
+            if new_balance <= 0.01:
+                cursor.execute("DELETE FROM debts WHERE id = %s", (debt_id,))
+                conn.commit()
+                return "paid_off"
+            else:
+                cursor.execute("UPDATE debts SET remaining_balance = %s, updated_at = %s WHERE id = %s", (new_balance, datetime.now(), debt_id))
+                conn.commit()
+                return "updated"
     finally:
         release_db_connection(conn)
 
@@ -227,7 +235,8 @@ def search_debts(query: str) -> List[Dict]:
             cursor.execute("""
                 SELECT d.id, d.customer_name, d.phone, d.amount_owed, d.remaining_balance, d.notes, d.seller_telegram_id, u.username, u.first_name
                 FROM debts d JOIN users u ON d.seller_telegram_id = u.telegram_id
-                WHERE d.phone LIKE %s OR d.customer_name_normalized LIKE %s ORDER BY d.created_at DESC
+                WHERE (d.phone LIKE %s OR d.customer_name_normalized LIKE %s) AND d.remaining_balance > 0.01
+                ORDER BY d.created_at DESC
             """, (f"%{query}%", f"%{norm_query}%"))
             rows = cursor.fetchall()
             return [{"id": r[0], "customer_name": r[1], "phone": r[2], "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5], "seller_telegram_id": r[6], "seller_name": r[7] or r[8] or str(r[6])} for r in rows]
@@ -240,7 +249,9 @@ def get_all_debts() -> List[Dict]:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT d.id, d.customer_name, d.phone, d.amount_owed, d.remaining_balance, d.notes, d.seller_telegram_id, d.created_at, u.username, u.first_name
-                FROM debts d JOIN users u ON d.seller_telegram_id = u.telegram_id ORDER BY d.created_at DESC
+                FROM debts d JOIN users u ON d.seller_telegram_id = u.telegram_id 
+                WHERE d.remaining_balance > 0.01
+                ORDER BY d.created_at DESC
             """)
             rows = cursor.fetchall()
             return [{"id": r[0], "customer_name": r[1], "phone": r[2], "amount_owed": r[3], "remaining_balance": r[4], "notes": r[5], "seller_telegram_id": r[6], "created_at": r[7], "seller_name": r[8] or r[9] or str(r[6])} for r in rows]
@@ -251,7 +262,7 @@ def get_total_outstanding() -> float:
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COALESCE(SUM(remaining_balance), 0) FROM debts")
+            cursor.execute("SELECT COALESCE(SUM(remaining_balance), 0) FROM debts WHERE remaining_balance > 0.01")
             return cursor.fetchone()[0]
     finally:
         release_db_connection(conn)
@@ -262,7 +273,7 @@ def get_outstanding_by_seller() -> List[Dict]:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT u.telegram_id, u.username, u.first_name, COALESCE(SUM(d.remaining_balance), 0)
-                FROM users u LEFT JOIN debts d ON u.telegram_id = d.seller_telegram_id
+                FROM users u LEFT JOIN debts d ON u.telegram_id = d.seller_telegram_id AND d.remaining_balance > 0.01
                 WHERE u.role IN ('admin','seller') GROUP BY u.telegram_id, u.username, u.first_name ORDER BY SUM(d.remaining_balance) DESC
             """)
             rows = cursor.fetchall()
@@ -276,6 +287,7 @@ def get_largest_debtors(limit: int = 5) -> List[Dict]:
         with conn.cursor() as cursor:
             cursor.execute("""
                 SELECT customer_name, phone, SUM(remaining_balance) FROM debts
+                WHERE remaining_balance > 0.01
                 GROUP BY customer_name, phone ORDER BY SUM(remaining_balance) DESC LIMIT %s
             """, (limit,))
             rows = cursor.fetchall()
@@ -283,24 +295,19 @@ def get_largest_debtors(limit: int = 5) -> List[Dict]:
     finally:
         release_db_connection(conn)
 
-# ---------- Пастки Доимий Меню (ReplyKeyboardMarkup - "Тўртта Тўртбурчак") ----------
+# ---------- Permanent Bottom Menu ----------
 def get_main_reply_keyboard(role: str) -> ReplyKeyboardMarkup:
     keyboard = []
-    
-    # Фақат админ ва сотувчилар кўрадиган тугмалар
     if role in ("admin", "seller"):
         keyboard.append([KeyboardButton("➕ Янги мизож ва қарз"), KeyboardButton("➕ Мавжуд мизожга қарз")])
         keyboard.append([KeyboardButton("💰 Тўлов қабул қилиш"), KeyboardButton("❌ Амални бекор қилиш")])
     
-    # Ҳамма кўра оладиган тугмалар
     keyboard.append([KeyboardButton("🔍 Qарзларни излаш"), KeyboardButton("📋 Барча қарзлар рўйхати")])
-    
-    # CSV экспорт ўрнига тўғридан-тўғри гуруҳга бэкап юбориш тугмаси қўшилди
     keyboard.append([KeyboardButton("📊 Статистика"), KeyboardButton("📢 Гуруҳга Бэкап юбориш")])
     
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ---------- Бот Старт Функцияси ----------
+# ---------- Initialization ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_user = await asyncio.to_thread(get_user, user.id)
@@ -308,7 +315,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db_user:
         admins_sellers = await asyncio.to_thread(get_admins_and_sellers)
         if not admins_sellers:
-            # Агар база бўм-бўш бўлса, биринчи старт берган одам автоматик АДМИН бўлади
             await asyncio.to_thread(create_user, user.id, user.username or "", user.first_name or "", "admin")
             await update.message.reply_text(f"✅ {user.first_name}, сиз тизимга АДМИН этиб тайинландингиз.", reply_markup=get_main_reply_keyboard("admin"))
         else:
@@ -317,7 +323,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     await update.message.reply_text("Тизим тайёр. Пастки менюдан фойдаланишингиз мумкин:", reply_markup=get_main_reply_keyboard(db_user['role']))
 
-# ---------- Пастки Меню Амаллари Бошланиши (Entry Points) ----------
+# ---------- Menu Entry Points ----------
 async def add_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👤 Мизож исми ва фамилиясини киритинг:")
     return ADD_NAME
@@ -331,18 +337,19 @@ async def pay_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PAY_DEBT_ID
 
 async def search_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Қидирилаётган мизож исми ёки телефонини ёзинг:")
+    await update.message.reply_text("🔍 Қидирилаётган мизож исмини ёзинг:")
     return SEARCH_QUERY
 
-# ---------- Тезкор Тугмалар Ишловчилари (Non-blocking Handlers) ----------
+# ---------- Fast Action Buttons ----------
 async def list_debts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     debts = await asyncio.to_thread(get_all_debts)
     if not debts:
         await update.message.reply_text("📋 Қарздорлар топилмади.")
     else:
-        msg = "📋 **Қарздорлар рўйхати (Охирги 15 та):**\n\n"
-        for d in debts[:15]:
-            msg += f"🆔 `ID: {d['id']}` | {d['customer_name']} | 💰 Қолдиқ: **{d['remaining_balance']:.2f}**\n"
+        msg = "📋 **Қарздорлар рўйхати:**\n\n"
+        for d in debts[:20]:
+            # Shows strictly ID, Name, Notes, Current Status
+            msg += f"🆔 `{d['id']}` | 👤 {d['customer_name']} | 📝 {d['notes'] or '-'} | 💰 **{d['remaining_balance']:.2f}**\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -358,18 +365,19 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# 📢 Тўғридан-тўғри Гуруҳга файл юборувчи функция (Сиз сўраган янгиланиш)
 async def send_backup_to_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     debts = await asyncio.to_thread(get_all_debts)
     if not debts:
-        await update.message.reply_text("Базада маълумот мавжуд эмас.")
+        await update.message.reply_text("Базада фаол қарздорлик мавжуд эмас.")
         return
         
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["ID", "Name", "Phone", "Balance"])
+    
+    # Exact specific columns requested: ID, Name, Notes, Current Debt Status
+    writer.writerow(["ID", "Name", "Notes", "Current Debt Status"])
     for d in debts: 
-        writer.writerow([d["id"], d["customer_name"], d["phone"], d["remaining_balance"]])
+        writer.writerow([d["id"], d["customer_name"], d["notes"] or "-", f"{d['remaining_balance']:.2f}"])
     output.seek(0)
     
     if BACKUP_GROUP_ID:
@@ -387,12 +395,12 @@ async def send_backup_to_group_handler(update: Update, context: ContextTypes.DEF
             await context.bot.send_document(**kwargs)
             await update.message.reply_text("📢 Тўлиқ CSV бэкап файли белгиланган масъул гуруҳга муваффақиятли юборилди!")
         except Exception as e:
-            logging.error(f"Гуруҳга бэкап юборишда хатолик: {e}")
+            logging.error(f"Backup group send error: {e}")
             await update.message.reply_text("❌ Гуруҳга бэкап юборишда хатолик юз берди.")
     else:
-        await update.message.reply_text("❌ Бэкап гуруҳ ID си (BACKUP_GROUP_ID) муҳит ўзгарувчиларига созланмаган.")
+        await update.message.reply_text("❌ Бэкап гуруҳ ID си тизимга созланмаган.")
 
-# ---------- Суҳбат Қадамлари Ишловчилари ----------
+# ---------- Flow Handlers ----------
 async def add_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['debt_name'] = update.message.text.strip()
     await update.message.reply_text("📞 Телефон рақамини киритинг (ўтказиб юбориш учун /skip):")
@@ -421,16 +429,16 @@ async def add_notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_debt, context.user_data['debt_name'], context.user_data['debt_phone'],
         context.user_data['debt_amount'], notes, update.effective_user.id
     )
-    await update.message.reply_text(f"✅ Муваффақиятли базага ёзилди! ID: `{debt_id}`", parse_mode="Markdown")
-    await send_backup_message(context, f"➕ **ЯНГИ ҚАРЗ**\nМизож: {context.user_data['debt_name']}\nСумма: {context.user_data['debt_amount']:.2f}")
+    await update.message.reply_text(f"✅ Базага ёзилди! ID: `{debt_id}`", parse_mode="Markdown")
+    await send_backup_message(context, f"➕ **ЯНГИ ҚАРЗ**\nМизож: {context.user_data['debt_name']}\nСумма: {context.user_data['debt_amount']:.2f}\nИзоҳ: {notes or '-'}")
     context.user_data.clear()
     return ConversationHandler.END
 
 async def exist_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     results = await asyncio.to_thread(search_debts, text)
-    if not map or not results:
-        await update.message.reply_text("❌ Бундай мизож топилмади. Қайта қидириб кўринг:")
+    if not results:
+        await update.message.reply_text("❌ Фаол қарзи бор бундай мизож топилмади. Қайта уриниб кўринг:")
         return EXIST_SEARCH
         
     buttons = [[InlineKeyboardButton(f"{r['customer_name']} (🆔 {r['id']})", callback_data=f"sel_{r['id']}")] for r in results[:8]]
@@ -454,6 +462,9 @@ async def exist_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if debt:
             new_owed = debt['amount_owed'] + amount
             new_balance = debt['remaining_balance'] + amount
+            
+            # Preserve existing notes, optional: append new indicator. 
+            # Leaving strictly to the existing logic for note preservation.
             await asyncio.to_thread(update_debt, debt_id, amount_owed=new_owed, remaining_balance=new_balance)
             await update.message.reply_text(f"✅ Қарз суммаси оширилди. Янги қолдиқ: **{new_balance:.2f}**", parse_mode="Markdown")
             await send_backup_message(context, f"🔄 **ҚАРЗ ОШИРИЛДИ**\nМизож: {debt['customer_name']}\nҚўшилди: {amount:.2f}\nЖорий қолдиқ: {new_balance:.2f}")
@@ -467,8 +478,8 @@ async def pay_debt_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         debt_id = int(update.message.text.strip())
         debt = await asyncio.to_thread(get_debt, debt_id)
-        if not debt:
-            await update.message.reply_text("❌ Бундай ID билан ҳеч қандай қарздорлик топилмади. Қайта киритинг:")
+        if not debt or debt['remaining_balance'] <= 0.01:
+            await update.message.reply_text("❌ Бундай ID билан фаол қарздорлик топилмади. Қайта киритинг:")
             return PAY_DEBT_ID
         context.user_data['pay_debt_id'] = debt_id
         await update.message.reply_text(f"👤 Мизож: {debt['customer_name']}\n💸 Жорий қарз қолдиғи: **{debt['remaining_balance']:.2f}**\n\nОлинган тўлов суммасини киритинг:")
@@ -481,10 +492,17 @@ async def pay_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         amount = float(update.message.text.strip())
         debt_id = context.user_data['pay_debt_id']
-        if await asyncio.to_thread(add_payment, debt_id, amount):
-            debt = await asyncio.to_thread(get_debt, debt_id)
-            await update.message.reply_text(f"✅ Тўлов қабул қилинди. Янги қолдиқ: **{debt['remaining_balance']:.2f}**", parse_mode="Markdown")
-            await send_backup_message(context, f"💰 **ТЎЛОВ ОЛИНДИ**\nМизож: {debt['customer_name']}\nТўлов суммаси: {amount:.2f}\nҚолдиқ қарз: {debt['remaining_balance']:.2f}")
+        debt = await asyncio.to_thread(get_debt, debt_id)
+        
+        status = await asyncio.to_thread(add_payment, debt_id, amount)
+        
+        if status == "paid_off":
+            await update.message.reply_text(f"🎉 ✅ Тўлов қабул қилинди! Қарз тўлиқ ёпилди ва базадан автоматик равишда ўчирилди.", parse_mode="Markdown")
+            await send_backup_message(context, f"💰 **ҚАРЗ ТЎЛИҚ ЁПИЛДИ (ЎЧИРИЛДИ)**\nМизож: {debt['customer_name']}\nЁпилган сумма: {amount:.2f}")
+        elif status == "updated":
+            updated_debt = await asyncio.to_thread(get_debt, debt_id)
+            await update.message.reply_text(f"✅ Тўлов қабул қилинди. Янги қолдиқ: **{updated_debt['remaining_balance']:.2f}**", parse_mode="Markdown")
+            await send_backup_message(context, f"💰 **ТЎЛОВ ОЛИНДИ**\nМизож: {debt['customer_name']}\nТўлов суммаси: {amount:.2f}\nҚолдиқ қарз: {updated_debt['remaining_balance']:.2f}")
         else:
             await update.message.reply_text("❌ Хато: Тўлов суммаси жорий умумий қарздан катта бўлиши мумкин эмас.")
     except ValueError:
@@ -497,11 +515,12 @@ async def search_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text.strip()
     debts = await asyncio.to_thread(search_debts, text)
     if not debts:
-        await update.message.reply_text("🔍 Мос келувчи мизож топилмади.")
+        await update.message.reply_text("🔍 Мос келувчи фаол мизож топилмади.")
     else:
         msg = "🔍 **Қидирув натижалари:**\n\n"
         for d in debts[:15]:
-            msg += f"🆔 `ID: {d['id']}` | {d['customer_name']} | 📞 {d['phone'] or '-'} | 💰 Қолдиқ: **{d['remaining_balance']:.2f}**\n"
+            # Shows strictly ID, Name, Notes, Current Status
+            msg += f"🆔 `{d['id']}` | 👤 {d['customer_name']} | 📝 Изоҳ: {d['notes'] or '-'} | 💰 Қолдиқ: **{d['remaining_balance']:.2f}**\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
     context.user_data.clear()
     return ConversationHandler.END
@@ -514,7 +533,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Жорий амал бекор қилинди.", reply_markup=get_main_reply_keyboard(role))
     return ConversationHandler.END
 
-# ---------- Ботни Алоҳида Оқимда Юрғизиш ----------
+# ---------- Polling Thread Execution ----------
 def run_telegram_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -555,18 +574,14 @@ def run_telegram_bot():
     
     app.run_polling(stop_signals=None)
 
-# ---------- Дастурни Ишга Тушириш Нуқтаси ----------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    # Таблицаларни автоматик текшириш ва яратиш
     init_db()
     
-    # Ботни орқа фонда ишга тушириш
     bot_thread = threading.Thread(target=run_telegram_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # Flask веб серверни асосий оқимда юрғизиш (Render тизими учун мажбурий)
     port = int(os.environ.get('PORT', 5000))
     flask_app.run(host='0.0.0.0', port=port)
