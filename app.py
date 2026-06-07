@@ -102,14 +102,13 @@ def init_db():
             telegram_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
             role TEXT CHECK(role IN ('admin','seller','viewer')) NOT NULL, created_at TIMESTAMP)''')
         
-        # Customers Table (Holds current balance)
-        cursor.execute('''CREATE TABLE IF NOT EXISTS customers (
+        # Unique table names to bypass any old existing tables
+        cursor.execute('''CREATE TABLE IF NOT EXISTS ledger_customers (
             id SERIAL PRIMARY KEY, name TEXT NOT NULL, name_normalized TEXT,
             balance REAL NOT NULL DEFAULT 0, created_at TIMESTAMP, updated_at TIMESTAMP)''')
         
-        # Transactions Table (The Ledger: Holds every individual debt taken or paid)
-        cursor.execute('''CREATE TABLE IF NOT EXISTS transactions (
-            id SERIAL PRIMARY KEY, customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,
+        cursor.execute('''CREATE TABLE IF NOT EXISTS ledger_transactions (
+            id SERIAL PRIMARY KEY, customer_id INTEGER REFERENCES ledger_customers(id) ON DELETE CASCADE,
             t_type TEXT CHECK(t_type IN ('debt', 'payment')) NOT NULL,
             amount REAL NOT NULL, note TEXT, seller_identifier TEXT, created_at TIMESTAMP)''')
 
@@ -135,40 +134,37 @@ def add_new_customer_and_debt(name: str, amount: float, note: str, seller_identi
     now = get_current_time()
     norm_name = normalize_text(name)
     with get_db(commit=True) as cursor:
-        cursor.execute("INSERT INTO customers (name, name_normalized, balance, created_at, updated_at) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        cursor.execute("INSERT INTO ledger_customers (name, name_normalized, balance, created_at, updated_at) VALUES (%s, %s, %s, %s, %s) RETURNING id",
                        (name, norm_name, amount, now, now))
         cust_id = cursor.fetchone()['id']
-        cursor.execute("INSERT INTO transactions (customer_id, t_type, amount, note, seller_identifier, created_at) VALUES (%s, 'debt', %s, %s, %s, %s)",
+        cursor.execute("INSERT INTO ledger_transactions (customer_id, t_type, amount, note, seller_identifier, created_at) VALUES (%s, 'debt', %s, %s, %s, %s)",
                        (cust_id, amount, note, seller_identifier, now))
         return cust_id
 
 def process_ledger_transaction(customer_id: int, t_type: str, amount: float, note: str, seller_identifier: str):
     now = get_current_time()
     with get_db(commit=True) as cursor:
-        cursor.execute("SELECT balance FROM customers WHERE id = %s", (customer_id,))
+        cursor.execute("SELECT balance FROM ledger_customers WHERE id = %s", (customer_id,))
         current_bal = cursor.fetchone()['balance']
         
         if t_type == 'debt': new_bal = current_bal + amount
-        else: new_bal = current_bal - amount # payment
+        else: new_bal = current_bal - amount
         
-        # Create transaction record
-        cursor.execute("INSERT INTO transactions (customer_id, t_type, amount, note, seller_identifier, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+        cursor.execute("INSERT INTO ledger_transactions (customer_id, t_type, amount, note, seller_identifier, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
                        (customer_id, t_type, amount, note, seller_identifier, now))
-        
-        # Update customer global balance
-        cursor.execute("UPDATE customers SET balance = %s, updated_at = %s WHERE id = %s", (new_bal, now, customer_id))
+        cursor.execute("UPDATE ledger_customers SET balance = %s, updated_at = %s WHERE id = %s", (new_bal, now, customer_id))
         return new_bal
 
 def get_customer(customer_id: int):
     with get_db() as cursor:
-        cursor.execute("SELECT * FROM customers WHERE id = %s", (customer_id,))
+        cursor.execute("SELECT * FROM ledger_customers WHERE id = %s", (customer_id,))
         return cursor.fetchone()
 
 def search_customers(query: str):
     norm_query = normalize_text(query)
     with get_db() as cursor:
         cursor.execute("""
-            SELECT * FROM customers 
+            SELECT * FROM ledger_customers 
             WHERE (name ILIKE %s OR name_normalized LIKE %s)
             AND balance > 0.01 ORDER BY updated_at DESC
         """, (f"%{query}%", f"%{norm_query}%"))
@@ -176,19 +172,19 @@ def search_customers(query: str):
 
 def get_customer_history(customer_id: int, limit: int = 15):
     with get_db() as cursor:
-        cursor.execute("SELECT * FROM transactions WHERE customer_id = %s ORDER BY created_at DESC LIMIT %s", (customer_id, limit))
+        cursor.execute("SELECT * FROM ledger_transactions WHERE customer_id = %s ORDER BY created_at DESC LIMIT %s", (customer_id, limit))
         return cursor.fetchall()
 
 def get_all_active_customers():
     with get_db() as cursor:
-        cursor.execute("SELECT * FROM customers WHERE balance > 0.01 ORDER BY updated_at DESC")
+        cursor.execute("SELECT * FROM ledger_customers WHERE balance > 0.01 ORDER BY updated_at DESC")
         return cursor.fetchall()
 
 def get_stats():
     with get_db() as cursor:
-        cursor.execute("SELECT COALESCE(SUM(balance), 0) as total FROM customers WHERE balance > 0.01")
+        cursor.execute("SELECT COALESCE(SUM(balance), 0) as total FROM ledger_customers WHERE balance > 0.01")
         total = cursor.fetchone()['total']
-        cursor.execute("SELECT name, balance FROM customers WHERE balance > 0.01 ORDER BY balance DESC LIMIT 5")
+        cursor.execute("SELECT name, balance FROM ledger_customers WHERE balance > 0.01 ORDER BY balance DESC LIMIT 5")
         return total, cursor.fetchall()
 
 # ---------- UI & Menus ----------
@@ -392,7 +388,6 @@ async def search_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("🔍 Топилмади.")
         return ConversationHandler.END
         
-    # We take the first match to show the detailed ledger
     cust = customers[0]
     history = await asyncio.to_thread(get_customer_history, cust['id'])
     
