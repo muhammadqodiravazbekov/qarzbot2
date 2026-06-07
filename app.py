@@ -41,12 +41,11 @@ flask_app = Flask(__name__)
 def health(): 
     return jsonify({"status": "alive", "message": "Bot is running optimally!"}), 200
 
-# ---------- Database Optimization (Context Manager & RealDictCursor) ----------
+# ---------- Database Optimization (Context Manager) ----------
 db_pool = ThreadedConnectionPool(1, 20, dsn=DATABASE_URL)
 
 @contextmanager
 def get_db(commit=False):
-    """Clean DB connections using dictionary cursors."""
     conn = db_pool.getconn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -64,9 +63,9 @@ def get_db(commit=False):
     SEARCH_QUERY, USER_ID, USER_ROLE
 ) = range(10)
 
-# ---------- Helper Functions (Smart Search) ----------
+# ---------- Helper Functions (Fixing the Search Logic) ----------
 def normalize_text(text: str) -> str:
-    """Узбек исмларидаги ҳарф ўзгаришларини (х/ҳ, қ/к) бир хил форматга келтиради."""
+    """Нормализация: Фақат кирилл-лотин ўгирилиши ва кичик ҳарфларга ўтказиш"""
     if not text: return ""
     cyrillic_to_latin = {
         'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo', 'ж': 'j', 'з': 'z', 'и': 'i', 'й': 'y', 
@@ -78,8 +77,7 @@ def normalize_text(text: str) -> str:
     for cyr, lat in cyrillic_to_latin.items(): 
         normalized = normalized.replace(cyr, lat)
     
-    # Лотин ҳарфларини ҳам тенглаштириш
-    normalized = normalized.replace('h', 'x').replace('q', 'k').replace("'", "")
+    normalized = normalized.replace("'", "")
     normalized = unicodedata.normalize('NFKD', normalized).encode('ASCII', 'ignore').decode('ASCII')
     return re.sub(r'[^a-z0-9]', '', normalized)
 
@@ -177,12 +175,15 @@ def add_payment(debt_id: int, amount: float, notes: str = "") -> str:
             return "updated"
 
 def search_debts(query: str):
+    norm_query = normalize_text(query)
     with get_db() as cursor:
+        # Энг муҳим тузатиш: Ҳам оригинал матндан (ILIKE), ҳам нормал матндан (LIKE) қидиради.
         cursor.execute("""
             SELECT d.*, u.first_name as seller_name FROM debts d 
             JOIN users u ON d.seller_telegram_id = u.telegram_id
-            WHERE d.customer_name_normalized LIKE %s AND d.remaining_balance > 0.01 ORDER BY d.created_at DESC
-        """, (f"%{normalize_text(query)}%",))
+            WHERE (d.customer_name ILIKE %s OR d.customer_name_normalized LIKE %s)
+            AND d.remaining_balance > 0.01 ORDER BY d.created_at DESC
+        """, (f"%{query}%", f"%{norm_query}%"))
         return cursor.fetchall()
 
 def get_all_debts():
@@ -213,7 +214,7 @@ def get_main_reply_keyboard(role: str) -> ReplyKeyboardMarkup:
 def cancel_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Бекор қилиш", callback_data="cancel_action")]])
 
-# ---------- Initialization & Global Callbacks ----------
+# ---------- Initialization & Callbacks ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_user = await asyncio.to_thread(get_user, user.id)
@@ -286,7 +287,7 @@ async def pay_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def search_and_select(update: Update, context: ContextTypes.DEFAULT_TYPE, next_state, action_type):
     results = await asyncio.to_thread(search_debts, update.message.text.strip())
     if not results:
-        await update.message.reply_text("❌ Топилмади. Бошқа исм ёзинг:", reply_markup=cancel_inline_keyboard())
+        await update.message.reply_text("❌ Топилмади. Бошқа исм ёзиб кўринг:", reply_markup=cancel_inline_keyboard())
         return next_state - 1 
         
     buttons = [[InlineKeyboardButton(f"{r['customer_name']} | {r['remaining_balance']:,.0f} сўм", callback_data=f"{action_type}_{r['id']}")] for r in results[:8]]
@@ -384,7 +385,7 @@ async def search_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not debts: 
         await update.message.reply_text("🔍 Топилмади.")
     else:
-        msg = "".join([f"👤 **{d['customer_name']}** | {d['remaining_balance']:,.2f} сўм\n" for d in debts[:15]])
+        msg = "".join([f"👤 **{d['customer_name']}** | {d['remaining_balance']:,.2f} сўм\n📝 Изоҳ: {d['notes'] or '-'}\n\n" for d in debts[:15]])
         await update.message.reply_text(msg, parse_mode="Markdown")
     context.user_data.clear()
     return ConversationHandler.END
@@ -401,16 +402,25 @@ async def send_backup_to_group_handler(update: Update, context: ContextTypes.DEF
     
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["ID", "Name", "Current Debt", "Date"])
+    writer.writerow(["ID", "Name", "Notes", "Current Debt Status", "Date Added"])
     for d in debts: 
-        writer.writerow([d['id'], d['customer_name'], d['remaining_balance'], d['created_at']])
+        writer.writerow([d['id'], d['customer_name'], d['notes'] or "-", f"{d['remaining_balance']:.2f}", d['created_at'].strftime('%d.%m.%Y')])
     output.seek(0)
     
     try: 
-        await context.bot.send_document(chat_id=int(BACKUP_GROUP_ID), document=io.BytesIO(output.getvalue().encode()), filename="Backup.csv")
+        kwargs = {
+            "chat_id": int(BACKUP_GROUP_ID),
+            "document": io.BytesIO(output.getvalue().encode()),
+            "filename": f"Qarzlar_Backup_{get_current_time().strftime('%d_%m_%Y')}.csv",
+            "caption": f"📢 **БАЗА БЭКАПИ**\n👤 Масъул: {update.effective_user.first_name}\n📅 Сана: {get_current_time().strftime('%d.%m.%Y %H:%M')}",
+            "parse_mode": "Markdown"
+        }
+        if BACKUP_TOPIC_ID: kwargs["message_thread_id"] = int(BACKUP_TOPIC_ID)
+        await context.bot.send_document(**kwargs)
         await update.message.reply_text("📢 Тўлиқ CSV бэкап файли гуруҳга муваффақиятли юборилди!")
-    except Exception: 
-        await update.message.reply_text("❌ Хатолик.")
+    except Exception as e: 
+        logging.error(f"Backup group send error: {e}")
+        await update.message.reply_text("❌ Гуруҳга бэкап юборишда хатолик юз берди.")
 
 # Users Management Flow
 async def users_management_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -546,7 +556,6 @@ def run_telegram_bot():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
     
-    # Render хатолигини тўғрилайдиган қисм (stop_signals=None)
     app.run_polling(stop_signals=None)
 
 if __name__ == "__main__":
