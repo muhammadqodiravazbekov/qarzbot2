@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import csv
 import logging
 import asyncio
 import threading
@@ -109,8 +111,23 @@ def extract_amount(text: str) -> float:
     return float(cleaned)
 
 def get_seller_username(user) -> str:
-    if user.username: return f"@{user.username}"
-    return f"@id_{user.id}"
+    """STRICT Username Check: Returns None if the user does not have a Telegram handle."""
+    if not user.username: 
+        return None
+    return f"@{user.username}"
+
+async def check_username_gatekeeper(update: Update) -> bool:
+    """Blocks the user immediately if they don't have a Telegram Username."""
+    if not get_seller_username(update.effective_user):
+        await update.message.reply_text(
+            "❌ **КИРИШ ТАҚИҚЛАНГАН!**\n\n"
+            "Сизнинг Телеграм профилингизда `@username` ўрнатилмаган. "
+            "Дастур фақат юзернейми бор сотувчиларни қайд этади.\n\n"
+            "⚙️ *Телеграм Созламаларига (Settings) кириб, ўзингизга Username ёзинг ва қайта уриниб кўринг.*", 
+            parse_mode="Markdown"
+        )
+        return False
+    return True
 
 async def notify_group(context: ContextTypes.DEFAULT_TYPE, action: str, customer: str, amount: float, seller_username: str, note: str = "", new_bal: float = None):
     if not BACKUP_GROUP_ID: return
@@ -206,6 +223,28 @@ def get_daily_stats():
         top_debtors = cursor.fetchall()
         return total, daily_debt, daily_pay, top_debtors
 
+def export_ledger_csv() -> bytes:
+    """Generates a CSV file of the entire ledger for Excel."""
+    with get_db() as cursor:
+        cursor.execute("""
+            SELECT c.name, t.t_type, t.amount, t.note, t.seller_username, t.created_at 
+            FROM ledger_transactions t 
+            JOIN ledger_customers c ON t.customer_id = c.id 
+            ORDER BY t.created_at DESC
+        """)
+        data = cursor.fetchall()
+        
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Mijoz', 'Amaliyot Turi', 'Summa', 'Izoh', 'Sotuvchi Username', 'Sana va Vaqt'])
+    
+    for row in data:
+        t_type = 'Qarz' if row['t_type'] == 'debt' else 'To\'lov'
+        date_str = row['created_at'].strftime('%Y-%m-%d %H:%M')
+        writer.writerow([row['name'], t_type, row['amount'], row['note'], row['seller_username'], date_str])
+        
+    return output.getvalue().encode('utf-8-sig') # utf-8-sig ensures Excel reads Cyrillic correctly
+
 # ==========================================
 # 6. UI KEYBOARDS & CONSTANTS
 # ==========================================
@@ -240,7 +279,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ Кириш тақиқланган. Асосий сотувчи сизни рўйхатга киритиши керак.")
         return
-    await update.message.reply_text("🛒 Мини-маркет Бухгалтерия Тизими тайёр:", reply_markup=get_main_reply_keyboard())
+    await update.message.reply_text("🛒 Мини-маркет Бухгалтерия Тизими тайёр. Амалиётни танланг:", reply_markup=get_main_reply_keyboard())
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for the /export command to download Excel/CSV."""
+    await update.message.reply_text("⏳ Маълумотлар Excel форматида тайёрланмоқда...")
+    csv_bytes = await asyncio.to_thread(export_ledger_csv)
+    filename = f"Hisobot_{get_current_time().strftime('%Y_%m_%d')}.csv"
+    await update.message.reply_document(document=io.BytesIO(csv_bytes), filename=filename)
 
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -253,6 +299,7 @@ async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- FLOW 1: NEW CUSTOMER ---
 async def add_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_username_gatekeeper(update): return ConversationHandler.END
     await update.message.reply_text("👤 **Янги мизожнинг Исм/Фамилиясини киритинг:**", parse_mode="Markdown", reply_markup=cancel_inline_keyboard())
     return ADD_NAME
 
@@ -287,6 +334,7 @@ async def add_notes_text_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 # --- FLOW 2: EXISTING CUSTOMER DEBT ---
 async def exist_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_username_gatekeeper(update): return ConversationHandler.END
     await update.message.reply_text("🔍 **Қарз қўшиладиган мизож исмини қидиринг:**", parse_mode="Markdown", reply_markup=cancel_inline_keyboard())
     return EXIST_SEARCH
 
@@ -339,6 +387,7 @@ async def exist_notes_text_handler(update: Update, context: ContextTypes.DEFAULT
 
 # --- FLOW 3: PAYMENTS ---
 async def pay_debt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_username_gatekeeper(update): return ConversationHandler.END
     await update.message.reply_text("🔍 **Тўлов қилаётган мизож исмини қидиринг:**", parse_mode="Markdown", reply_markup=cancel_inline_keyboard())
     return PAY_SEARCH
 
@@ -371,9 +420,6 @@ async def select_pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def pay_amount_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = extract_amount(update.message.text)
-        cust_id = context.user_data['selected_cust_id']
-        cust = await asyncio.to_thread(get_customer, cust_id)
-        
         if amount <= 0: raise ValueError()
         context.user_data['pay_amount'] = amount
         await update.message.reply_text("📝 **Тўлов усулини ёзинг (Нақд, Карта):**", parse_mode="Markdown", reply_markup=cancel_inline_keyboard())
@@ -460,7 +506,6 @@ def run_telegram_bot():
     asyncio.set_event_loop(loop)
     app = Application.builder().token(BOT_TOKEN).request(HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)).build()
 
-    # Filter out navigation commands so text handlers don't catch them
     nav_filter = ~(filters.Regex("^(➕ Янги мизож ва қарз|➕ Мавжуд мизожга қарз|💰 Тўлов қабул қилиш|🔍 Қарзларни излаш|📊 Статистика|❌ Амални бекор қилиш)$") | filters.COMMAND)
 
     conv_handler = ConversationHandler(
@@ -496,7 +541,6 @@ def run_telegram_bot():
             MessageHandler(filters.Regex("^❌ Амални бекор қилиш$"), cancel_action),
             CallbackQueryHandler(cancel_action, pattern="^cancel_action$"),
             
-            # Universal fallback for main menu buttons pressed mid-flow
             MessageHandler(filters.Regex("^➕ Янги мизож ва қарз$"), add_debt_start),
             MessageHandler(filters.Regex("^➕ Мавжуд мизожга қарз$"), exist_debt_start),
             MessageHandler(filters.Regex("^💰 Тўлов қабул қилиш$"), pay_debt_start),
@@ -508,6 +552,7 @@ def run_telegram_bot():
     
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("export", export_command))
     
     logging.info("Starting Telegram Bot Engine...")
     app.run_polling(stop_signals=None)
@@ -518,13 +563,10 @@ def run_telegram_bot():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    # Initialize the Database Schema
     init_db()
     
-    # Run Telegram Bot in Background Thread
     bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
     bot_thread.start()
     
-    # Run Flask Web Server on Main Thread (required by Render)
     port = int(os.environ.get('PORT', 5000))
     flask_app.run(host='0.0.0.0', port=port)
