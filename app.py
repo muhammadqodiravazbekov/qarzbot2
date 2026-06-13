@@ -54,6 +54,26 @@ def db(commit=False):
 
 def init_db():
     with db(commit=True) as c:
+        # Check if our clean schema already exists
+        c.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name='transactions' AND column_name='customer_id'
+        """)
+        already_clean = c.fetchone()
+
+        if not already_clean:
+            # Drop all old tables from previous versions
+            c.execute("DROP TABLE IF EXISTS ledger_transactions CASCADE")
+            c.execute("DROP TABLE IF EXISTS ledger_customers CASCADE")
+            c.execute("DROP TABLE IF EXISTS transactions CASCADE")
+            c.execute("DROP TABLE IF EXISTS payments CASCADE")
+            c.execute("DROP TABLE IF EXISTS debts CASCADE")
+            c.execute("DROP TABLE IF EXISTS customers CASCADE")
+            c.execute("DROP TABLE IF EXISTS clients CASCADE")
+            c.execute("DROP TABLE IF EXISTS settings CASCADE")
+            c.execute("DROP TABLE IF EXISTS users CASCADE")
+
+        # Create tables (IF NOT EXISTS = safe on restarts)
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id BIGINT PRIMARY KEY,
@@ -78,15 +98,9 @@ def init_db():
                 t_type      TEXT CHECK(t_type IN ('debt','payment')) NOT NULL,
                 amount      REAL NOT NULL,
                 note        TEXT,
-                by_username TEXT NOT NULL,
+                by_username TEXT NOT NULL DEFAULT '@unknown',
                 created_at  TIMESTAMPTZ DEFAULT NOW()
             )""")
-        # Migration: add missing columns if old table exists
-        c.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS name_norm TEXT")
-        c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS note TEXT")
-        c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS by_username TEXT")
-        # Set default for by_username if null
-        c.execute("UPDATE transactions SET by_username='@unknown' WHERE by_username IS NULL")
         c.execute("CREATE INDEX IF NOT EXISTS idx_cust_norm ON customers(name_norm)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tx_cust  ON transactions(customer_id)")
 
