@@ -81,6 +81,12 @@ def init_db():
                 by_username TEXT NOT NULL,
                 created_at  TIMESTAMPTZ DEFAULT NOW()
             )""")
+        # Migration: add missing columns if old table exists
+        c.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS name_norm TEXT")
+        c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS note TEXT")
+        c.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS by_username TEXT")
+        # Set default for by_username if null
+        c.execute("UPDATE transactions SET by_username='@unknown' WHERE by_username IS NULL")
         c.execute("CREATE INDEX IF NOT EXISTS idx_cust_norm ON customers(name_norm)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tx_cust  ON transactions(customer_id)")
 
