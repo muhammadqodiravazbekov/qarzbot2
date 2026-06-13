@@ -20,6 +20,10 @@ BACKUP_TOPIC = os.environ.get('BACKUP_TOPIC_ID')
 if not BOT_TOKEN or not DATABASE_URL:
     raise ValueError("BOT_TOKEN ёки DATABASE_URL топилмади!")
 
+# Psycopg2 да "postgres://" ни қўллаб-қувватламайди, уни "postgresql://" га ўзгартирамиз
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 UZB_TZ = timezone(timedelta(hours=5))
 def now(): return datetime.now(UZB_TZ)
 
@@ -44,7 +48,10 @@ def db(commit=False):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             yield cur
-        if commit: conn.commit()
+        if commit: 
+            conn.commit()
+        else:
+            conn.rollback()  # Транзакция ҳолатини тозалаш ва "idle in transaction" ни олдини олиш
     except Exception as e:
         conn.rollback()
         logging.error(f"DB хатоси: {e}")
@@ -54,26 +61,9 @@ def db(commit=False):
 
 def init_db():
     with db(commit=True) as c:
-        # Check if our clean schema already exists
-        c.execute("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name='transactions' AND column_name='customer_id'
-        """)
-        already_clean = c.fetchone()
-
-        if not already_clean:
-            # Drop all old tables from previous versions
-            c.execute("DROP TABLE IF EXISTS ledger_transactions CASCADE")
-            c.execute("DROP TABLE IF EXISTS ledger_customers CASCADE")
-            c.execute("DROP TABLE IF EXISTS transactions CASCADE")
-            c.execute("DROP TABLE IF EXISTS payments CASCADE")
-            c.execute("DROP TABLE IF EXISTS debts CASCADE")
-            c.execute("DROP TABLE IF EXISTS customers CASCADE")
-            c.execute("DROP TABLE IF EXISTS clients CASCADE")
-            c.execute("DROP TABLE IF EXISTS settings CASCADE")
-            c.execute("DROP TABLE IF EXISTS users CASCADE")
-
-        # Create tables (IF NOT EXISTS = safe on restarts)
+        # МАЪЛУМОТЛАР ХАВФСИЗЛИГИ УЧУН DROP TABLE БУЙРУҚЛАРИ ОЛИБ ТАШЛАНДИ
+        
+        # Жадвалларни хавфсиз яратиш (IF NOT EXISTS)
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id BIGINT PRIMARY KEY,
@@ -104,7 +94,7 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_cust_norm ON customers(name_norm)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_tx_cust  ON transactions(customer_id)")
 
-init_db()
+# Глобал қисмдаги эрта чақирув олиб ташланди, у фақат __main__ ичида бажарилади.
 
 # ══════════════════════════════════════════
 # ЁРДАМЧИ ФУНКЦИЯЛАР
@@ -260,12 +250,12 @@ async def check_admin(update: Update) -> bool:
     return False
 
 # ══════════════════════════════════════════
-# ГУРУҲГА ХАБАР
+# ГУРУҲГА ХАБАР (HTML формати хавфсизроқ)
 # ══════════════════════════════════════════
 async def notify(ctx, text: str):
     if not BACKUP_CHAT: return
     try:
-        kwargs = {"chat_id": int(BACKUP_CHAT), "text": text, "parse_mode": "Markdown"}
+        kwargs = {"chat_id": int(BACKUP_CHAT), "text": text, "parse_mode": "HTML"}
         if BACKUP_TOPIC: kwargs["message_thread_id"] = int(BACKUP_TOPIC)
         await ctx.bot.send_message(**kwargs)
     except Exception as e:
@@ -317,7 +307,7 @@ def kb_note_skip() -> InlineKeyboardMarkup:
 ) = range(13)
 
 # ══════════════════════════════════════════
-# /start
+# /start (HTML га ўтказилди)
 # ══════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -328,7 +318,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(db_create_user, u.id, u.username or "", u.first_name or "", "admin")
             dbu = {'role': 'admin'}
             await update.message.reply_text(
-                "✅ Сиз *АДМИН* этиб тайинландингиз.\nТизим тайёр.", parse_mode="Markdown",
+                "✅ Сиз <b>АДМИН</b> этиб тайинландингиз.\nТизим тайёр.", parse_mode="HTML",
                 reply_markup=kb_main('admin'))
         else:
             await update.message.reply_text("❌ Кириш тақиқланган. Админга мурожаат қилинг.")
@@ -336,11 +326,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     role = dbu['role']
     emoji = "👑" if role=='admin' else "🛒" if role=='seller' else "👁"
     await update.message.reply_text(
-        f"{emoji} Хуш келибсиз, {uname(u)}!\nРолингиз: *{role.upper()}*", parse_mode="Markdown",
+        f"{emoji} Хуш келибсиз, {uname(u)}!\nРолингиз: <b>{role.upper()}</b>", parse_mode="HTML",
         reply_markup=kb_main(role))
 
 # ══════════════════════════════════════════
-# /jami
+# /jami (HTML га ўтказилди)
 # ══════════════════════════════════════════
 async def cmd_jami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows, total = await asyncio.to_thread(db_jami)
@@ -349,31 +339,31 @@ async def cmd_jami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = []
     for r in rows[:30]:
-        lines.append(f"• {r['name']}: *{fmt(r['balance'])}* сўм")
-    text = "📋 *Қарздорлар рўйхати:*\n\n" + "\n".join(lines)
+        lines.append(f"• {r['name']}: <b>{fmt(r['balance'])}</b> сўм")
+    text = "📋 <b>Қарздорлар рўйхати:</b>\n\n" + "\n".join(lines)
     if len(rows) > 30:
-        text += f"\n\n_...ва яна {len(rows)-30} та_"
-    text += f"\n\n💰 *Жами: {fmt(total)} сўм*"
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text += f"\n\n<i>...ва яна {len(rows)-30} та</i>"
+    text += f"\n\n💰 <b>Жами: {fmt(total)} сўм</b>"
+    await update.message.reply_text(text, parse_mode="HTML")
 
 # ══════════════════════════════════════════
-# СТАТИСТИКА
+# СТАТИСТИКА (HTML га ўтказилди)
 # ══════════════════════════════════════════
 async def handle_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total, td, tp, top, active = await asyncio.to_thread(db_stats)
-    msg = (f"📊 *Статистика*\n\n"
-           f"💰 Умумий қарз: *{fmt(total)} сўм*\n"
-           f"👥 Фаол қарздорлар: *{active}*\n\n"
-           f"📅 *Бугун:*\n"
+    msg = (f"📊 <b>Статистика</b>\n\n"
+           f"💰 Умумий қарз: <b>{fmt(total)} сўм</b>\n"
+           f"👥 Фаол қарздорлар: <b>{active}</b>\n\n"
+           f"📅 <b>Бугун:</b>\n"
            f"➕ Берилган қарзлар: {fmt(td)} сўм\n"
            f"✅ Қабул қилинган тўловлар: {fmt(tp)} сўм\n\n"
-           f"🔥 *Энг катта қарздорлар:*\n")
+           f"🔥 <b>Энг катта қарздорлар:</b>\n")
     for i, r in enumerate(top, 1):
         msg += f"{i}. {r['name']} — {fmt(r['balance'])} сўм\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 # ══════════════════════════════════════════
-# БЭКАП
+# БЭКАП (HTML га ўтказилди)
 # ══════════════════════════════════════════
 async def handle_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await check_admin(update): return
@@ -393,8 +383,8 @@ async def handle_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "chat_id": int(BACKUP_CHAT),
             "document": io.BytesIO(out.getvalue().encode('utf-8-sig')),
             "filename": fname,
-            "caption": f"📢 *Бэкап*\n👤 {uname(update.effective_user)}\n📅 {now().strftime('%d.%m.%Y %H:%M')}",
-            "parse_mode": "Markdown"
+            "caption": f"📢 <b>Бэкап</b>\n👤 {uname(update.effective_user)}\n📅 {now().strftime('%d.%m.%Y %H:%M')}",
+            "parse_mode": "HTML"
         }
         if BACKUP_TOPIC: kwargs["message_thread_id"] = int(BACKUP_TOPIC)
         await ctx.bot.send_document(**kwargs)
@@ -452,13 +442,13 @@ async def _save_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE, note: str):
     name, amt = ctx.user_data['name'], ctx.user_data['amt']
     who = uname(update.effective_user)
     await asyncio.to_thread(db_add_customer, name, amt, note, who)
-    text = (f"✅ *Янги мижоз қўшилди!*\n\n"
+    text = (f"✅ <b>Янги мижоз қўшилди!</b>\n\n"
             f"👤 {name}\n💰 {fmt(amt)} сўм\n"
             f"📝 {note or '—'}\n💼 {who}")
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
     else:
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="HTML")
     await notify(ctx, text)
     ctx.user_data.clear()
     return ConversationHandler.END
@@ -484,8 +474,8 @@ async def ex_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data['cid'] = cid
     cust = await asyncio.to_thread(db_get_cust, cid)
     await q.edit_message_text(
-        f"👤 *{cust['name']}*\n📊 Жорий қарз: {fmt(cust['balance'])} сўм\n\n💰 Қўшиладиган сумма:",
-        parse_mode="Markdown", reply_markup=kb_cancel())
+        f"👤 <b>{cust['name']}</b>\n📊 Жорий қарз: {fmt(cust['balance'])} сўм\n\n💰 Қўшиладиган сумма:",
+        parse_mode="HTML", reply_markup=kb_cancel())
     return S_EX_AMT
 
 async def ex_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -511,15 +501,15 @@ async def _save_ex(update: Update, ctx: ContextTypes.DEFAULT_TYPE, note: str):
     who = uname(update.effective_user)
     cust = await asyncio.to_thread(db_get_cust, cid)
     new_bal = await asyncio.to_thread(db_add_debt, cid, amt, note, who)
-    text = (f"✅ *Қарз қўшилди!*\n\n"
+    text = (f"✅ <b>Қарз қўшилди!</b>\n\n"
             f"👤 {cust['name']}\n"
             f"➕ {fmt(amt)} сўм\n"
             f"📊 Янги баланс: {fmt(new_bal)} сўм\n"
             f"📝 {note or '—'}\n💼 {who}")
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
     else:
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="HTML")
     await notify(ctx, text)
     ctx.user_data.clear()
     return ConversationHandler.END
@@ -557,8 +547,8 @@ async def pay_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Бекор", callback_data="cancel")]
     ])
     await q.edit_message_text(
-        f"👤 *{cust['name']}*\n💸 Қарзи: {fmt(cust['balance'])} сўм\n\n💵 Тўлов суммасини киритинг:",
-        parse_mode="Markdown", reply_markup=btns)
+        f"👤 <b>{cust['name']}</b>\n💸 Қарзи: {fmt(cust['balance'])} сўм\n\n💵 Тўлов суммасини киритинг:",
+        parse_mode="HTML", reply_markup=btns)
     return S_PAY_AMT
 
 async def pay_amt_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -586,13 +576,13 @@ async def _save_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE, amt: float):
         return S_PAY_AMT
     new_bal = await asyncio.to_thread(db_add_payment, cid, amt, "", who)
     if new_bal <= 0:
-        text = f"🎉 *Қарз тўлиқ ёпилди!*\n\n👤 {cust['name']}\n✅ {fmt(amt)} сўм тўланди\n💼 {who}"
+        text = f"🎉 <b>Қарз тўлиқ ёпилди!</b>\n\n👤 {cust['name']}\n✅ {fmt(amt)} сўм тўланди\n💼 {who}"
     else:
-        text = f"✅ *Тўлов қабул қилинди!*\n\n👤 {cust['name']}\n💵 {fmt(amt)} сўм\n📊 Қолган қарз: {fmt(new_bal)} сўм\n💼 {who}"
+        text = f"✅ <b>Тўлов қабул қилинди!</b>\n\n👤 {cust['name']}\n💵 {fmt(amt)} сўм\n📊 Қолган қарз: {fmt(new_bal)} сўм\n💼 {who}"
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(text, parse_mode="HTML")
     else:
-        await update.message.reply_text(text, parse_mode="Markdown")
+        await update.message.reply_text(text, parse_mode="HTML")
     await notify(ctx, text)
     ctx.user_data.clear()
     return ConversationHandler.END
@@ -612,17 +602,17 @@ async def search_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     for r in results[:5]:
         hist = await asyncio.to_thread(db_history, r['id'], 10)
-        msg = f"👤 *{r['name']}*\n📊 Қарз: *{fmt(r['balance'])} сўм*\n\n📜 *Тарих:*\n"
+        msg = f"👤 <b>{r['name']}</b>\n📊 Қарз: <b>{fmt(r['balance'])} сўм</b>\n\n📜 <b>Тарих:</b>\n"
         msg += "─────────────────\n"
         if not hist:
-            msg += "_Тарих бўш_\n"
+            msg += "<i>Тарих бўш</i>\n"
         else:
             for h in hist:
                 d = h['created_at'].strftime('%d.%m %H:%M') if h['created_at'] else ''
                 sign = "🔴" if h['t_type']=='debt' else "🟢"
                 note = f" • {h['note']}" if h['note'] else ""
                 msg += f"{sign} {fmt(h['amount'])} сўм{note}\n   {h['by_username']} | {d}\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(msg, parse_mode="HTML")
     ctx.user_data.clear()
     return ConversationHandler.END
 
@@ -637,7 +627,7 @@ async def users_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📋 Рўйхат",   callback_data="u_list")],
         [InlineKeyboardButton("❌ Бекор",    callback_data="cancel")],
     ])
-    await update.message.reply_text("👥 *Фойдаланувчилар:*", parse_mode="Markdown", reply_markup=kb)
+    await update.message.reply_text("👥 <b>Фойдаланувчилар:</b>", parse_mode="HTML", reply_markup=kb)
     return S_USR_ACT
 
 async def users_act_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -645,11 +635,11 @@ async def users_act_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if q.data == "u_list":
         users = await asyncio.to_thread(db_all_users)
-        msg = "👥 *Рўйхат:*\n\n"
+        msg = "👥 <b>Рўйхат:</b>\n\n"
         for u in users:
             role_e = "👑" if u['role']=='admin' else "🛒" if u['role']=='seller' else "👁"
-            msg += f"{role_e} @{u['username'] or 'noname'} | `{u['telegram_id']}` | *{u['role']}*\n"
-        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb_cancel())
+            msg += f"{role_e} @{u['username'] or 'noname'} | <code>{u['telegram_id']}</code> | <b>{u['role']}</b>\n"
+        await q.edit_message_text(msg, parse_mode="HTML", reply_markup=kb_cancel())
         return S_USR_ACT
     elif q.data == "u_add":
         ctx.user_data['u_act'] = 'add'
@@ -695,7 +685,7 @@ async def users_role_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except:
         uname_str, fname = "", "Foydalanuvchi"
     if await asyncio.to_thread(db_create_user, tid, uname_str, fname, role):
-        await q.edit_message_text(f"✅ @{uname_str or tid} — *{role}* роли билан қўшилди.", parse_mode="Markdown")
+        await q.edit_message_text(f"✅ @{uname_str or tid} — <b>{role}</b> роли билан қўшилди.", parse_mode="HTML")
     else:
         await q.edit_message_text("❌ Бу фойдаланувчи аллақачон мавжуд.")
     ctx.user_data.clear()
@@ -792,8 +782,12 @@ def run_bot():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    
+    # Маълумотлар базасини хавфсиз ишга тушириш
     init_db()
+    
     t = threading.Thread(target=run_bot, daemon=True)
     t.start()
+    
     port = int(os.environ.get('PORT', 5000))
     flask_app.run(host='0.0.0.0', port=port)
